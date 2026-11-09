@@ -69,7 +69,7 @@ static inline tgk_complex fetch_chi_ts(const tgk_grid *gr, const tgk_complex *ph
  * 3. Magnetic curvature & grad-B drifts:
  *    -i * omega_d(kx, ky, z, v_par, mu) * (h + Z_s/T_s F0 chi)
  * 4. Equilibrium density & temperature gradient drive:
- *    -i * ky * (R/L_n + (v_par^2/2 + mu*B - 3/2) * R/L_T) * F0 * chi
+ *    -i * ky * (a/L_n + (v_par^2/2 + mu*B - 3/2) * a/L_T) * F0 * chi,  a/L = (R/L) / (R/a)
  * 5. Nonlinear E x B advection:
  *    - { chi, h } = -(dchi/dx * dh/dy - dchi/dy * dh/dx) via pseudo-spectral 2/3-dealiased FFTs. */
 void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
@@ -221,19 +221,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                 const tgk_real *ady     = ws->rx_apar_dy_z + r_off;
                 const tgk_complex *hz   = h_slab           + z_off;
 
-                /* Form i*kx*h and i*ky*h in spectral space */
-                for (int iky = 0; iky < nky; iky++) {
-                    tgk_real ky = (tgk_real)gr->ky[iky];
-                    size_t row = (size_t)iky * nkx;
-                    for (int ikx = 0; ikx < nkx; ikx++) {
-                        tgk_real kx = (tgk_real)gr->kx[ikx];
-                        size_t k = row + ikx;
-                        tgk_complex hk = hz[k];
-                        spec_tmp1[k] = tgk_cmul_is(kx, hk);
-                        spec_tmp2[k] = tgk_cmul_is(ky, hk);
-                    }
-                }
-                tgk_fft_c2r_pair_dealiased(&ctx->fft, spec_tmp1, spec_tmp2,
+                tgk_fft_c2r_grad_dealiased(&ctx->fft, hz, gr->kx, gr->ky,
                                            ws->rx_dh_dx, ws->rx_dh_dy, fft_scr1, fft_scr2);
 
                 /* Pointwise Poisson bracket in real space:
@@ -288,13 +276,14 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
 
             /* Precompute z-plane scalar coefficients */
             const tgk_real c_stream = skip_par_stream ? 0.0f : (tgk_real)(-vths * vpar * gpar * inv_12dz);
-            const tgk_real c_mirror = (tgk_real)(-vths * mu * dbdz * gpar * inv_12dv);
+            const tgk_real c_mirror = (tgk_real)(vths * mu * dbdz * gpar * inv_12dv);
             const tgk_real c_hypz   = (tgk_real)(-hyp_z * fabs(vths * vpar * gpar) / gm->dz);
             const tgk_real c_zt_f0  = (tgk_real)(z_t) * f0_val;
 
             /* Energy factor for temperature-gradient drive: E/T_s - 3/2 = v_par^2/2 + mu*B - 1.5 */
             const double e_norm     = 0.5 * vpar * vpar + mu * b - 1.5;
-            const double omega_star_fac = -(sp->fprim + e_norm * sp->tprim) * (double)f0_val;
+            /* fprim, tprim are R/L_n, R/L_T; lengths are normalized to a, so divide by R/a */
+            const double omega_star_fac = -(sp->fprim + e_norm * sp->tprim) / p->rmaj * (double)f0_val;
             /* Magnetic drift velocity factor: (T_s / Z_s) * (v_par^2 + mu*B) */
             const double v_drift    = (ts / zs) * (vpar * vpar + mu * b);
 
@@ -303,12 +292,158 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
             const tgk_real    *j0_z   = j0_sm     + z_off;
             tgk_complex64     *qn_z   = ws->qn_num_loc  + z_off;
             tgk_complex64     *am_z   = ws->amp_num_loc + z_off;
+#if TGK_HAS_NEON && !TGK_REAL_IS_FP64
+            const int interior_z      = (iz >= 2 && iz < nz - 2);
+            const int has_mirror      = (fabs(c_mirror) > 1e-18f);
+#endif
 
             for (int iky = 0; iky < nky; iky++) {
                 const double ky = gr->ky[iky];
                 const tgk_real w_star = (tgk_real)(ky * omega_star_fac);
+#if TGK_HAS_NEON && !TGK_REAL_IS_FP64
+                const tgk_real wd_y   = (tgk_real)(v_drift * cv_y * ky);
+                const tgk_real wd_x   = (tgk_real)(v_drift * cv_x);
+#endif
 
-                for (int ikx = 0; ikx < nkx; ikx++) {
+                int ikx = 0;
+#if TGK_HAS_NEON && !TGK_REAL_IS_FP64
+                if (interior_z) {
+                    const tgk_complex *hz_m2 = h_slab + z_off - 2 * nplane + (size_t)iky * nkx;
+                    const tgk_complex *hz_m1 = h_slab + z_off - 1 * nplane + (size_t)iky * nkx;
+                    const tgk_complex *hz_0  = h_slab + z_off              + (size_t)iky * nkx;
+                    const tgk_complex *hz_p1 = h_slab + z_off + 1 * nplane + (size_t)iky * nkx;
+                    const tgk_complex *hz_p2 = h_slab + z_off + 2 * nplane + (size_t)iky * nkx;
+
+                    const tgk_complex *pz_m2 = ctx->phi + z_off - 2 * nplane + (size_t)iky * nkx;
+                    const tgk_complex *pz_m1 = ctx->phi + z_off - 1 * nplane + (size_t)iky * nkx;
+                    const tgk_complex *pz_0  = ctx->phi + z_off              + (size_t)iky * nkx;
+                    const tgk_complex *pz_p1 = ctx->phi + z_off + 1 * nplane + (size_t)iky * nkx;
+                    const tgk_complex *pz_p2 = ctx->phi + z_off + 2 * nplane + (size_t)iky * nkx;
+
+                    const tgk_real *jz_m2 = j0_sm + z_off - 2 * nplane + (size_t)iky * nkx;
+                    const tgk_real *jz_m1 = j0_sm + z_off - 1 * nplane + (size_t)iky * nkx;
+                    const tgk_real *jz_0  = j0_sm + z_off              + (size_t)iky * nkx;
+                    const tgk_real *jz_p1 = j0_sm + z_off + 1 * nplane + (size_t)iky * nkx;
+                    const tgk_real *jz_p2 = j0_sm + z_off + 2 * nplane + (size_t)iky * nkx;
+
+                    /* Skip (iky=0, ikx=0..1) in NEON loop only on odd nkx; actually just handle (0,0) after! */
+                    for (; ikx + 2 <= nkx; ikx += 2) {
+                        const size_t k = (size_t)iky * nkx + ikx;
+                        const size_t idx_full = slab_offset + z_off + k;
+
+                        float kx0 = (float)gr->kx[ikx];
+                        float kx1 = (float)gr->kx[ikx + 1];
+                        float wd0 = wd_y + wd_x * kx0;
+                        float wd1 = wd_y + wd_x * kx1;
+
+                        tgk_vc2 h0 = tgk_vc2_load(hz_0 + ikx);
+                        float j0_0 = jz_0[ikx], j0_1 = jz_0[ikx + 1];
+
+                        tgk_vc2 p0 = tgk_vc2_load(pz_0 + ikx);
+                        if (has_apar) {
+                            p0 = vfmsq_n_f32(p0, tgk_vc2_load(apar_z + k), v_fac);
+                        }
+                        tgk_vc2 chi0 = tgk_vc2_mul_real2(j0_0, j0_1, p0);
+
+                        tgk_vc2 g0  = tgk_vc2_fma_real(h0, c_zt_f0, chi0);
+                        tgk_vc2 rhs = tgk_vc2_mul_is2(w_star, w_star, chi0);
+                        rhs = tgk_vc2_fma_is2(rhs, -wd0, -wd1, g0);
+
+                        if (!skip_par_stream) {
+                            tgk_vc2 hm2 = tgk_vc2_load(hz_m2 + ikx);
+                            tgk_vc2 hm1 = tgk_vc2_load(hz_m1 + ikx);
+                            tgk_vc2 hp1 = tgk_vc2_load(hz_p1 + ikx);
+                            tgk_vc2 hp2 = tgk_vc2_load(hz_p2 + ikx);
+
+                            tgk_vc2 pm2 = tgk_vc2_load(pz_m2 + ikx);
+                            tgk_vc2 pm1 = tgk_vc2_load(pz_m1 + ikx);
+                            tgk_vc2 pp1 = tgk_vc2_load(pz_p1 + ikx);
+                            tgk_vc2 pp2 = tgk_vc2_load(pz_p2 + ikx);
+                            if (has_apar) {
+                                pm2 = vfmsq_n_f32(pm2, tgk_vc2_load(ctx->apar + z_off - 2 * nplane + k), v_fac);
+                                pm1 = vfmsq_n_f32(pm1, tgk_vc2_load(ctx->apar + z_off - 1 * nplane + k), v_fac);
+                                pp1 = vfmsq_n_f32(pp1, tgk_vc2_load(ctx->apar + z_off + 1 * nplane + k), v_fac);
+                                pp2 = vfmsq_n_f32(pp2, tgk_vc2_load(ctx->apar + z_off + 2 * nplane + k), v_fac);
+                            }
+                            tgk_vc2 cm2 = tgk_vc2_mul_real2(jz_m2[ikx], jz_m2[ikx + 1], pm2);
+                            tgk_vc2 cm1 = tgk_vc2_mul_real2(jz_m1[ikx], jz_m1[ikx + 1], pm1);
+                            tgk_vc2 cp1 = tgk_vc2_mul_real2(jz_p1[ikx], jz_p1[ikx + 1], pp1);
+                            tgk_vc2 cp2 = tgk_vc2_mul_real2(jz_p2[ikx], jz_p2[ikx + 1], pp2);
+
+                            tgk_vc2 gm2 = tgk_vc2_fma_real(hm2, c_zt_f0, cm2);
+                            tgk_vc2 gm1 = tgk_vc2_fma_real(hm1, c_zt_f0, cm1);
+                            tgk_vc2 gp1 = tgk_vc2_fma_real(hp1, c_zt_f0, cp1);
+                            tgk_vc2 gp2 = tgk_vc2_fma_real(hp2, c_zt_f0, cp2);
+
+                            tgk_vc2 dg_dz = vsubq_f32(gm2, gp2);
+                            dg_dz = vfmaq_n_f32(dg_dz, vsubq_f32(gp1, gm1), 8.0f);
+                            rhs = vfmaq_n_f32(rhs, dg_dz, c_stream);
+
+                            tgk_vc2 d4h = vaddq_f32(hm2, hp2);
+                            d4h = vfmsq_n_f32(d4h, vaddq_f32(hm1, hp1), 4.0f);
+                            d4h = vfmaq_n_f32(d4h, h0, 6.0f);
+                            rhs = vfmaq_n_f32(rhs, d4h, c_hypz);
+                        }
+
+                        if (has_mirror) {
+                            tgk_vc2 vm2 = h_vm2 ? tgk_vc2_load(h_vm2 + z_off + k) : tgk_vc2_zero();
+                            tgk_vc2 vm1 = h_vm1 ? tgk_vc2_load(h_vm1 + z_off + k) : tgk_vc2_zero();
+                            tgk_vc2 vp1 = h_vp1 ? tgk_vc2_load(h_vp1 + z_off + k) : tgk_vc2_zero();
+                            tgk_vc2 vp2 = h_vp2 ? tgk_vc2_load(h_vp2 + z_off + k) : tgk_vc2_zero();
+
+                            tgk_vc2 dh_dv = vsubq_f32(vm2, vp2);
+                            dh_dv = vfmaq_n_f32(dh_dv, vsubq_f32(vp1, vm1), 8.0f);
+                            rhs = vfmaq_n_f32(rhs, dh_dv, c_mirror);
+                        }
+
+                        if (do_nl) {
+                            rhs = vaddq_f32(rhs, tgk_vc2_load(spec_tmp1 + k));
+                        }
+
+                        if (iky == 0 && ikx == 0) {
+                            rhs = vsetq_lane_f32(0.0f, rhs, 0);
+                            rhs = vsetq_lane_f32(0.0f, rhs, 1);
+                        }
+
+                        tgk_vc2 h_next;
+                        if (stage_idx == 0) {
+                            tgk_vc2 r_acc = vmulq_n_f32(rhs, dt_b);
+                            tgk_vc2_store(ctx->h_rhs + idx_full, r_acc);
+                            h_next = vfmaq_n_f32(h0, rhs, dt_c);
+                            tgk_vc2_store(ctx->h_stage + idx_full, h_next);
+                        } else if (!is_last_stg) {
+                            tgk_vc2 r_acc = vfmaq_n_f32(tgk_vc2_load(ctx->h_rhs + idx_full), rhs, dt_b);
+                            tgk_vc2_store(ctx->h_rhs + idx_full, r_acc);
+                            h_next = vfmaq_n_f32(tgk_vc2_load(ctx->h + idx_full), rhs, dt_c);
+                            tgk_vc2_store(ctx->h_stage + idx_full, h_next);
+                        } else {
+                            tgk_vc2 r_acc  = tgk_vc2_load(ctx->h_rhs + idx_full);
+                            tgk_vc2 h_base = tgk_vc2_load(ctx->h     + idx_full);
+                            h_next = vfmaq_n_f32(vaddq_f32(h_base, r_acc), rhs, dt_b);
+                            tgk_vc2_store(ctx->h + idx_full, h_next);
+                        }
+
+                        double h0_re = (double)vgetq_lane_f32(h_next, 0);
+                        double h0_im = (double)vgetq_lane_f32(h_next, 1);
+                        double h1_re = (double)vgetq_lane_f32(h_next, 2);
+                        double h1_im = (double)vgetq_lane_f32(h_next, 3);
+                        double j0_d0 = (double)j0_0;
+                        double j0_d1 = (double)j0_1;
+
+                        qn_z[k].re     += wq * j0_d0 * h0_re;
+                        qn_z[k].im     += wq * j0_d0 * h0_im;
+                        qn_z[k + 1].re += wq * j0_d1 * h1_re;
+                        qn_z[k + 1].im += wq * j0_d1 * h1_im;
+                        if (has_apar) {
+                            am_z[k].re     += wa * j0_d0 * h0_re;
+                            am_z[k].im     += wa * j0_d0 * h0_im;
+                            am_z[k + 1].re += wa * j0_d1 * h1_re;
+                            am_z[k + 1].im += wa * j0_d1 * h1_im;
+                        }
+                    }
+                }
+#endif
+                for (; ikx < nkx; ikx++) {
                     const size_t k = (size_t)iky * nkx + ikx;
                     const size_t idx_full = slab_offset + z_off + k;
 
@@ -463,7 +598,7 @@ double tgk_rhs_compute_linear_cfl(const tgk_ctx *ctx) {
             double rate_mirror = 1.4 * vths * mumax * dbdz * gpar / gr->dv;
             double rate_drift  = (sp->temp / fabs(sp->charge)) * (vmax * vmax + mumax * b) *
                                  (fabs(gm->cv_y[iz]) * ky_max + fabs(gm->cv_x[iz]) * kx_max);
-            double rate_drive  = ky_max * (fabs(sp->fprim) + 2.0 * fabs(sp->tprim));
+            double rate_drive  = ky_max * (fabs(sp->fprim) + 2.0 * fabs(sp->tprim)) / p->rmaj;
 
             double tot = rate_stream + rate_mirror + rate_drift + rate_drive;
             if (tot > max_rate) max_rate = tot;

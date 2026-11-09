@@ -335,7 +335,7 @@ int tgk_ctx_init(tgk_ctx *ctx, const tgk_param *p) {
     /* Allocate per-thread scratch workspaces */
     size_t n_real  = (size_t)ctx->fft.nx_pad * (size_t)ctx->fft.ny_pad;
     size_t n_realz = (size_t)ctx->grid.nz * n_real;
-    size_t n_cx1   = 2 * ctx->grid.nplane + 2 * (size_t)ctx->fft.nx_pad * (size_t)ctx->grid.nky;
+    size_t n_cx1   = 2 * ctx->grid.nplane + 2 * (size_t)ctx->fft.nx_pad * (size_t)ctx->fft.ny_pad;
     size_t n_cx2   = 4 * (size_t)(ctx->fft.nx_pad + ctx->fft.ny_pad);
 
     for (int t = 0; t < ctx->nthreads; t++) {

@@ -90,8 +90,8 @@ Output from `make check` on an **Apple M4 Pro** (8 Performance cores + 4 Efficie
   [PASS] Checkpoint restart is 100% bit-identical across 55296 complex state points
 
 --- Test 6: Apple M4 Pro Fused RK Stage Bandwidth Benchmark ---
-  [PASS] M4 Pro (8 P-cores, FP32): 127.13 ms/stage (508.54 ms/step) on 25.17M grid points (192.0 MB/copy, 7.9 GB/s fused bandwidth)
-  [PASS] M4 Pro (8 P-cores, FP64): 190.59 ms/stage (762.37 ms/step) on 25.17M grid points (384.0 MB/copy, 10.6 GB/s fused bandwidth)
+  [PASS] M4 Pro (8 P-cores, FP32): 76.56 ms/stage (306.22 ms/step) on 25.17M grid points (192.0 MB/copy, 13.1 GB/s fused bandwidth)
+  [PASS] M4 Pro (8 P-cores, FP64): 148.28 ms/stage (593.10 ms/step) on 25.17M grid points (384.0 MB/copy, 13.6 GB/s fused bandwidth)
 
 === Comparing FP32-mixed vs Full FP64 Agreement (< 0.5% threshold) ===
   [PASS] FP32-mixed vs Full FP64 relative diff: |phi|^2=0.0000%, Q_i=0.0000%, gamma=0.0001% (all < 0.5%)

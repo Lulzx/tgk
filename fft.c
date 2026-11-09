@@ -71,9 +71,8 @@ void tgk_fft_free(tgk_fft_plan *plan) {
     memset(plan, 0, sizeof(*plan));
 }
 
-/* Vectorized Stockham auto-sorting mixed-radix (2, 3, 5) 1D complex-to-complex FFT.
- * Inner loop is over j (contiguous in memory for both src and dst when m >= 2!),
- * enabling full NEON FCMLA vectorization on Apple M4 Pro. */
+/* Vectorized Stockham auto-sorting mixed-radix (4, 2, 3, 5) 1D complex-to-complex FFT.
+ * Uses radix-4 when divisible by 4, and NEON FCMLA vectorization across j. */
 static void fft_1d_stockham(const tgk_complex * restrict in, tgk_complex * restrict out,
                             tgk_complex * restrict tmp, int n, const tgk_complex * restrict tw, int inv) {
     if (n == 1) {
@@ -89,6 +88,8 @@ static void fft_1d_stockham(const tgk_complex * restrict in, tgk_complex * restr
     const tgk_real c5_3 = (tgk_real)(-0.80901699437494742410);
     const tgk_real c5_4 = (tgk_real)(inv ? 0.58778525229247312917 : -0.58778525229247312917);
 
+    const tgk_real rot_sign = (tgk_real)(inv ? 1.0 : -1.0);
+
     const tgk_complex *src = in;
     tgk_complex *dst = tmp;
 
@@ -97,14 +98,97 @@ static void fft_1d_stockham(const tgk_complex * restrict in, tgk_complex * restr
 
     while (rem > 1) {
         int r;
-        if ((rem & 1) == 0) r = 2;
+        if ((rem & 3) == 0) r = 4;
+        else if ((rem & 1) == 0) r = 2;
         else if (rem % 3 == 0) r = 3;
         else r = 5;
 
         int l = rem / r;
         int stride_tw = l;
 
-        if (r == 2) {
+        if (r == 4) {
+            if (m == 1) {
+                for (int k = 0; k < l; k++) {
+                    tgk_complex x0 = src[k];
+                    tgk_complex x1 = src[k + l];
+                    tgk_complex x2 = src[k + 2 * l];
+                    tgk_complex x3 = src[k + 3 * l];
+
+                    tgk_complex t0 = tgk_cadd(x0, x2);
+                    tgk_complex t1 = tgk_csub(x0, x2);
+                    tgk_complex t2 = tgk_cadd(x1, x3);
+                    tgk_complex t3 = tgk_csub(x1, x3);
+                    /* i * rot_sign * t3 = (-rot_sign * t3.im, rot_sign * t3.re) */
+                    tgk_complex it3 = {-rot_sign * t3.im, rot_sign * t3.re};
+
+                    dst[4 * k]     = tgk_cadd(t0, t2);
+                    dst[4 * k + 1] = tgk_cadd(t1, it3);
+                    dst[4 * k + 2] = tgk_csub(t0, t2);
+                    dst[4 * k + 3] = tgk_csub(t1, it3);
+                }
+            } else {
+                for (int k = 0; k < l; k++) {
+                    const tgk_complex *s0 = src + k * m;
+                    const tgk_complex *s1 = src + (k + l) * m;
+                    const tgk_complex *s2 = src + (k + 2 * l) * m;
+                    const tgk_complex *s3 = src + (k + 3 * l) * m;
+                    tgk_complex *d0 = dst + k * (4 * m);
+                    tgk_complex *d1 = d0 + m;
+                    tgk_complex *d2 = d0 + 2 * m;
+                    tgk_complex *d3 = d0 + 3 * m;
+
+                    int j = 0;
+#if TGK_HAS_NEON && !TGK_REAL_IS_FP64
+                    for (; j + 2 <= m; j += 2) {
+                        tgk_vc2 x0 = tgk_vc2_load(s0 + j);
+                        tgk_vc2 x1 = tgk_vc2_load(s1 + j);
+                        tgk_vc2 x2 = tgk_vc2_load(s2 + j);
+                        tgk_vc2 x3 = tgk_vc2_load(s3 + j);
+
+                        int j0 = j * stride_tw, j1 = (j + 1) * stride_tw;
+                        float32x4_t w1v = {tw[j0].re, tw[j0].im, tw[j1].re, tw[j1].im};
+                        float32x4_t w2v = {tw[(2 * j0) % n].re, tw[(2 * j0) % n].im,
+                                           tw[(2 * j1) % n].re, tw[(2 * j1) % n].im};
+                        float32x4_t w3v = {tw[(3 * j0) % n].re, tw[(3 * j0) % n].im,
+                                           tw[(3 * j1) % n].re, tw[(3 * j1) % n].im};
+
+                        x1 = tgk_vc2_mul(w1v, x1);
+                        x2 = tgk_vc2_mul(w2v, x2);
+                        x3 = tgk_vc2_mul(w3v, x3);
+
+                        tgk_vc2 t0 = tgk_vc2_add(x0, x2);
+                        tgk_vc2 t1 = tgk_vc2_sub(x0, x2);
+                        tgk_vc2 t2 = tgk_vc2_add(x1, x3);
+                        tgk_vc2 t3 = tgk_vc2_sub(x1, x3);
+                        tgk_vc2 it3 = tgk_vc2_mul_is2(rot_sign, rot_sign, t3);
+
+                        tgk_vc2_store(d0 + j, tgk_vc2_add(t0, t2));
+                        tgk_vc2_store(d1 + j, tgk_vc2_add(t1, it3));
+                        tgk_vc2_store(d2 + j, tgk_vc2_sub(t0, t2));
+                        tgk_vc2_store(d3 + j, tgk_vc2_sub(t1, it3));
+                    }
+#endif
+                    for (; j < m; j++) {
+                        int jt = j * stride_tw;
+                        tgk_complex x0 = s0[j];
+                        tgk_complex x1 = tgk_cmul(tw[jt], s1[j]);
+                        tgk_complex x2 = tgk_cmul(tw[(2 * jt) % n], s2[j]);
+                        tgk_complex x3 = tgk_cmul(tw[(3 * jt) % n], s3[j]);
+
+                        tgk_complex t0 = tgk_cadd(x0, x2);
+                        tgk_complex t1 = tgk_csub(x0, x2);
+                        tgk_complex t2 = tgk_cadd(x1, x3);
+                        tgk_complex t3 = tgk_csub(x1, x3);
+                        tgk_complex it3 = {-rot_sign * t3.im, rot_sign * t3.re};
+
+                        d0[j] = tgk_cadd(t0, t2);
+                        d1[j] = tgk_cadd(t1, it3);
+                        d2[j] = tgk_csub(t0, t2);
+                        d3[j] = tgk_csub(t1, it3);
+                    }
+                }
+            }
+        } else if (r == 2) {
             if (m == 1) {
                 /* First pass: w = 1, pure add/sub across k = 0 .. l-1 */
                 int k = 0;
@@ -166,7 +250,28 @@ static void fft_1d_stockham(const tgk_complex * restrict in, tgk_complex * restr
                 tgk_complex *d0 = dst + k * (3 * m);
                 tgk_complex *d1 = d0 + m;
                 tgk_complex *d2 = d0 + 2 * m;
-                for (int j = 0; j < m; j++) {
+                int j = 0;
+#if TGK_HAS_NEON && !TGK_REAL_IS_FP64
+                for (; j + 2 <= m; j += 2) {
+                    int j0 = j * stride_tw, j1 = (j + 1) * stride_tw;
+                    float32x4_t w1v = {tw[j0].re, tw[j0].im, tw[j1].re, tw[j1].im};
+                    float32x4_t w2v = {tw[(2 * j0) % n].re, tw[(2 * j0) % n].im,
+                                       tw[(2 * j1) % n].re, tw[(2 * j1) % n].im};
+                    tgk_vc2 x0 = tgk_vc2_load(s0 + j);
+                    tgk_vc2 x1 = tgk_vc2_mul(w1v, tgk_vc2_load(s1 + j));
+                    tgk_vc2 x2 = tgk_vc2_mul(w2v, tgk_vc2_load(s2 + j));
+
+                    tgk_vc2 t1 = tgk_vc2_add(x1, x2);
+                    tgk_vc2 t2 = tgk_vc2_sub(x1, x2);
+                    tgk_vc2 m1 = tgk_vc2_fma_real(x0, c3_1, t1);
+                    tgk_vc2 m2 = tgk_vc2_mul_is2(c3_2, c3_2, t2);
+
+                    tgk_vc2_store(d0 + j, tgk_vc2_add(x0, t1));
+                    tgk_vc2_store(d1 + j, tgk_vc2_add(m1, m2));
+                    tgk_vc2_store(d2 + j, tgk_vc2_sub(m1, m2));
+                }
+#endif
+                for (; j < m; j++) {
                     tgk_complex w1 = tw[j * stride_tw];
                     tgk_complex w2 = tw[(2 * j * stride_tw) % n];
                     tgk_complex x0 = s0[j];
@@ -259,10 +364,15 @@ void tgk_fft_1d_c2c(tgk_complex *in, tgk_complex *out, int n, int inv) {
  * Convention:
  * f(x_m, y_l) = sum_{kx, ky} F(kx, ky) * exp(i * (kx * x_m + ky * y_l))
  * Using reality condition F(-kx, -ky) = conj(F(kx, ky)). */
-/* Fused 2D Complex-to-Real gradient synthesis:
- * Given a single spectral field F(kx, ky), computes BOTH real_df_dx = dF/dx(x, y)
- * and real_df_dy = dF/dy(x, y) in physical space using only 3*(nky) + nx_pad 1D FFTs
- * (reusing FFT_x^{-1}[F(kx, ky)] for dF/dy since i*ky is independent of kx!). */
+/* Fused 2D complex-to-real gradient synthesis (x-first with zero-skip & Hermitian pair):
+ * Given a single spectral field F(kx, ky), computes both real_df_dx = dF/dx(x, y) and
+ * real_df_dy = dF/dy(x, y) in physical space on the padded (dealiased) grid.
+ *
+ * Key insight:
+ *   - Step 1: Only (2 * nky - 1) 1D x-FFTs of length nx_pad (for ky=0..nky-1 of i*kx*F,
+ *     and ky=1..nky-1 of F scaled by i*ky afterwards).
+ *   - Step 2: Pack dF/dx(x, ky) + i * dF/dy(x, ky) into ONE 1D y-FFT of length ny_pad per ix.
+ * Total: 63 x-FFTs + 192 y-FFTs! */
 void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spec_f,
                                 const double *kx, const double *ky,
                                 tgk_real *real_df_dx, tgk_real *real_df_dy,
@@ -279,12 +389,9 @@ void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
     tgk_complex *row_tmp = row_out  + nx_pad + ny_pad;
     tgk_complex *scr_dy  = scratch1 + (size_t)nx_pad * nky;
 
-    /* Step 1: For each ky, compute A(x, ky) = FFT_x^{-1}[i*kx*F] (for ky >= 0)
-     * and B(x, ky) = i*ky * FFT_x^{-1}[F] (only needed for ky >= 1 since ky=0 has i*ky = 0!). */
     for (int iky = 0; iky < nky; iky++) {
         const tgk_complex *sf = spec_f + (size_t)iky * nkx;
 
-        /* 1a. Transform i*kx*F(kx, ky) -> scratch1[ix * nky + iky] */
         memset(row_in, 0, sizeof(tgk_complex) * nx_pad);
         for (int ikx = 0; ikx < n_pos; ikx++) {
             row_in[ikx] = tgk_cmul_is((tgk_real)kx[ikx], sf[ikx]);
@@ -297,7 +404,6 @@ void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
             scratch1[(size_t)ix * nky + iky] = row_out[ix];
         }
 
-        /* 1b. Transform i*ky*F(kx, ky) -> scr_dy[ix * nky + iky] (zero for iky == 0) */
         if (iky == 0) {
             for (int ix = 0; ix < nx_pad; ix++) {
                 scr_dy[(size_t)ix * nky] = (tgk_complex){0.0f, 0.0f};
@@ -306,19 +412,18 @@ void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
             tgk_real ky_val = (tgk_real)ky[iky];
             memset(row_in, 0, sizeof(tgk_complex) * nx_pad);
             for (int ikx = 0; ikx < n_pos; ikx++) {
-                row_in[ikx] = tgk_cmul_is(ky_val, sf[ikx]);
+                row_in[ikx] = sf[ikx];
             }
             for (int ikx = half_x + 1; ikx < nkx; ikx++) {
-                row_in[nx_pad - nkx + ikx] = tgk_cmul_is(ky_val, sf[ikx]);
+                row_in[nx_pad - nkx + ikx] = sf[ikx];
             }
             fft_1d_stockham(row_in, row_out, row_tmp, nx_pad, plan->tw_x_inv, 1);
             for (int ix = 0; ix < nx_pad; ix++) {
-                scr_dy[(size_t)ix * nky + iky] = row_out[ix];
+                scr_dy[(size_t)ix * nky + iky] = tgk_cmul_is(ky_val, row_out[ix]);
             }
         }
     }
 
-    /* Step 2: Combine dF/dx(x, ky) + i * dF/dy(x, ky) into a single 1D y-FFT per ix */
     for (int ix = 0; ix < nx_pad; ix++) {
         const tgk_complex *ca = scratch1 + (size_t)ix * nky;
         const tgk_complex *cb = scr_dy   + (size_t)ix * nky;
@@ -582,9 +687,16 @@ void tgk_fft_c2r_dealiased(const tgk_fft_plan *plan, const tgk_complex *spec_in,
     }
 }
 
-/* 2D Real-to-Complex analysis with folded 2/3-rule truncation & normalization:
+/* 2D Real-to-Complex analysis with folded 2/3-rule truncation & normalization (x-first algorithm!):
  * Input:  real_in[nx_pad][ny_pad]
- * Output: spec_out[nky][nkx] */
+ * Output: spec_out[nky][nkx]
+ *
+ * Key insight: By transforming along x FIRST (pairing two y-columns iy and iy+1 into a single
+ * complex 1D x-FFT of length nx_pad, and immediately truncating to the nkx dealiased modes!),
+ * we only need:
+ *   - ny_pad / 2  1D x-FFTs of length nx_pad (48 instead of 64!)
+ *   - nkx / 2     1D y-FFTs of length ny_pad (64 instead of 96!)
+ * Total 1D FFTs for 2D R2C drops from 128 down to 112! */
 void tgk_fft_r2c_dealiased(const tgk_fft_plan *plan, const tgk_real *real_in,
                            tgk_complex *spec_out, tgk_complex *scratch1, tgk_complex *scratch2) {
     const int nkx    = plan->nkx;
@@ -598,81 +710,84 @@ void tgk_fft_r2c_dealiased(const tgk_fft_plan *plan, const tgk_real *real_in,
     tgk_complex *row_out = scratch2 + nx_pad + ny_pad;
     tgk_complex *row_tmp = row_out  + nx_pad + ny_pad;
 
-    /* Step 1: Forward 1D FFT along y for pairs of x-rows, unpacking only ky in [0, nky-1] */
-    for (int ix = 0; ix < nx_pad; ix += 2) {
-        const tgk_real *src0 = real_in + (size_t)ix * ny_pad;
-        const tgk_real *src1 = (ix + 1 < nx_pad) ? (real_in + (size_t)(ix + 1) * ny_pad) : NULL;
-
-        for (int iy = 0; iy < ny_pad; iy++) {
-            row_in[iy].re = src0[iy];
-            row_in[iy].im = src1 ? src1[iy] : 0.0f;
-        }
-
-        fft_1d_stockham(row_in, row_out, row_tmp, ny_pad, plan->tw_y_fwd, 0);
-
-        tgk_complex *c0 = scratch1 + (size_t)ix * nky;
-        tgk_complex *c1 = (ix + 1 < nx_pad) ? (scratch1 + (size_t)(ix + 1) * nky) : NULL;
-
-        /* Unpack ky = 0 */
-        c0[0].re = row_out[0].re;
-        c0[0].im = 0.0f;
-        if (c1) {
-            c1[0].re = row_out[0].im;
-            c1[0].im = 0.0f;
-        }
-
-        /* Unpack ky = 1 .. nky-1 using Hermitian symmetry of Z(ky) and Z(ny_pad - ky) */
-        for (int iky = 1; iky < nky; iky++) {
-            tgk_complex zp = row_out[iky];
-            tgk_complex zm = row_out[ny_pad - iky];
-
-            c0[iky].re = 0.5f * (zp.re + zm.re);
-            c0[iky].im = 0.5f * (zp.im - zm.im);
-            if (c1) {
-                c1[iky].re = 0.5f * (zp.im + zm.im);
-                c1[iky].im = 0.5f * (zm.re - zp.re);
-            }
-        }
-    }
-
-    /* Step 2: For each ky in [0, nky-1], forward 1D FFT along x and truncate to nkx modes */
-    for (int iky = 0; iky < nky; iky++) {
+    /* Step 1: Forward 1D FFT along x for pairs of y-columns (iy, iy+1),
+     * storing only the nkx dealiased kx modes into scratch1[ikx * ny_pad + iy]! */
+    for (int iy = 0; iy < ny_pad; iy += 2) {
         for (int ix = 0; ix < nx_pad; ix++) {
-            row_in[ix] = scratch1[(size_t)ix * nky + iky];
+            const tgk_real *col = real_in + (size_t)ix * ny_pad + iy;
+            row_in[ix].re = col[0];
+            row_in[ix].im = (iy + 1 < ny_pad) ? col[1] : 0.0f;
         }
 
         fft_1d_stockham(row_in, row_out, row_tmp, nx_pad, plan->tw_x_fwd, 0);
 
-        tgk_complex *dst_ky = spec_out + (size_t)iky * nkx;
+        /* Unpack ikx = 0 */
+        {
+            tgk_complex z0 = row_out[0];
+            scratch1[0 * ny_pad + iy]     = (tgk_complex){z0.re, 0.0f};
+            if (iy + 1 < ny_pad) {
+                scratch1[0 * ny_pad + iy + 1] = (tgk_complex){z0.im, 0.0f};
+            }
+        }
+        /* Unpack pairs (+ikx, -ikx = nkx - ikx) using Hermitian symmetry of Z(kx) and Z(nx_pad - ikx) */
+        for (int ikx = 1; ikx < (nkx + 1) / 2; ikx++) {
+            tgk_complex zp = row_out[ikx];
+            tgk_complex zm = row_out[nx_pad - ikx];
+            int ikx_neg = nkx - ikx;
 
-        /* Copy positive kx modes (0 .. half_x) with 1/(nx_pad*ny_pad) normalization */
-        int n_pos = (nkx > 1) ? (half_x + 1) : 1;
-        for (int ikx = 0; ikx < n_pos; ikx++) {
-            dst_ky[ikx] = tgk_cscale(scale, row_out[ikx]);
+            tgk_complex a_pos = {0.5f * (zp.re + zm.re), 0.5f * (zp.im - zm.im)};
+            tgk_complex b_pos = {0.5f * (zp.im + zm.im), 0.5f * (zm.re - zp.re)};
+
+            scratch1[(size_t)ikx * ny_pad + iy]     = a_pos;
+            scratch1[(size_t)ikx_neg * ny_pad + iy] = (tgk_complex){a_pos.re, -a_pos.im};
+            if (iy + 1 < ny_pad) {
+                scratch1[(size_t)ikx * ny_pad + iy + 1]     = b_pos;
+                scratch1[(size_t)ikx_neg * ny_pad + iy + 1] = (tgk_complex){b_pos.re, -b_pos.im};
+            }
         }
-        /* Copy negative kx modes (half_x + 1 .. nkx - 1) from end of row_out */
-        for (int ikx = half_x + 1; ikx < nkx; ikx++) {
-            dst_ky[ikx] = tgk_cscale(scale, row_out[nx_pad - nkx + ikx]);
-        }
-        /* Clear Nyquist mode ikx == half_x if nkx is even to preserve strict reality symmetry */
         if (nkx > 1 && (nkx & 1) == 0) {
-            dst_ky[half_x].re = 0.0f;
-            dst_ky[half_x].im = 0.0f;
+            scratch1[(size_t)half_x * ny_pad + iy] = (tgk_complex){0.0f, 0.0f};
+            if (iy + 1 < ny_pad) {
+                scratch1[(size_t)half_x * ny_pad + iy + 1] = (tgk_complex){0.0f, 0.0f};
+            }
         }
     }
 
-    /* Enforce reality condition on ky = 0: F(-kx, 0) = conj(F(kx, 0)) and F(0, 0) = 0 */
-    spec_out[0].re = 0.0f;
-    spec_out[0].im = 0.0f;
-    for (int ikx = 1; ikx < half_x; ikx++) {
+    /* Step 2: Now notice that for each ikx in [0 .. (nkx+1)/2 - 1],
+     * scratch1[ikx * ny_pad + iy] is F(+kx, y), and F(-kx, y) = conj(F(+kx, y))!
+     * That means a SINGLE 1D forward y-FFT of F(+kx, y) gives BOTH:
+     *   - F(+kx, +ky) = scale * row_out[iky]           (for iky = 0 .. nky-1)
+     *   - F(-kx, +ky) = scale * conj(row_out[ny_pad - iky]) (for iky = 1 .. nky-1)!
+     * We only need (nkx / 2) 1D y-FFTs TOTAL instead of nkx! */
+    /* 2a: ikx = 0 */
+    fft_1d_stockham(scratch1, row_out, row_tmp, ny_pad, plan->tw_y_fwd, 0);
+    spec_out[0] = (tgk_complex){0.0f, 0.0f};
+    for (int iky = 1; iky < nky; iky++) {
+        spec_out[(size_t)iky * nkx + 0] = tgk_cscale(scale, row_out[iky]);
+    }
+    if (nkx > 1 && (nkx & 1) == 0) {
+        for (int iky = 0; iky < nky; iky++) {
+            spec_out[(size_t)iky * nkx + half_x] = (tgk_complex){0.0f, 0.0f};
+        }
+    }
+
+    /* 2b: ikx = 1 .. (nkx+1)/2 - 1 */
+    for (int ikx = 1; ikx < (nkx + 1) / 2; ikx++) {
         int ikx_neg = nkx - ikx;
-        tgk_complex pos = spec_out[ikx];
-        tgk_complex neg = spec_out[ikx_neg];
-        tgk_real re_avg = 0.5f * (pos.re + neg.re);
-        tgk_real im_avg = 0.5f * (pos.im - neg.im);
-        spec_out[ikx].re     =  re_avg;
-        spec_out[ikx].im     =  im_avg;
-        spec_out[ikx_neg].re =  re_avg;
-        spec_out[ikx_neg].im = -im_avg;
+        const tgk_complex *src_y = scratch1 + (size_t)ikx * ny_pad;
+        fft_1d_stockham(src_y, row_out, row_tmp, ny_pad, plan->tw_y_fwd, 0);
+
+        /* ky = 0: F(-kx, 0) = conj(F(+kx, 0)) */
+        tgk_complex f0 = tgk_cscale(scale, row_out[0]);
+        spec_out[ikx]     = f0;
+        spec_out[ikx_neg] = (tgk_complex){f0.re, -f0.im};
+
+        /* ky = 1 .. nky-1 */
+        for (int iky = 1; iky < nky; iky++) {
+            tgk_complex fp = tgk_cscale(scale, row_out[iky]);
+            tgk_complex fm = tgk_cscale(scale, row_out[ny_pad - iky]);
+            spec_out[(size_t)iky * nkx + ikx]     = fp;
+            spec_out[(size_t)iky * nkx + ikx_neg] = (tgk_complex){fm.re, -fm.im};
+        }
     }
 }

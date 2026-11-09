@@ -139,7 +139,7 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
 
                             if (iky > 0) {
                                 /* Radial ExB velocity v_ExB_x = -dchi/dy = -i * ky * chi
-                                 * Flux = Re[ (-i * ky * chi)^* * h_s ] = ky * (chi.re * h.im - chi.im * h.re) */
+                                 * Flux = Re[ (-i * ky * chi)^* * h_s ] = ky * (chi.im * h.re - chi.re * h.im) */
                                 tgk_complex chi = ph;
                                 if (has_apar) {
                                     chi.re -= v_fac * ctx->apar[z_off + k].re;
@@ -147,7 +147,7 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
                                 }
                                 double chi_re = j0_val * (double)chi.re;
                                 double chi_im = j0_val * (double)chi.im;
-                                double v_exb_h = ky * (chi_re * (double)hk.im - chi_im * (double)hk.re);
+                                double v_exb_h = ky * (chi_im * (double)hk.re - chi_re * (double)hk.im);
 
                                 g_acc += wz * m_fac * ns * w_vel * v_exb_h;
                                 q_acc += wz * m_fac * ns * ts * w_vel * energy * v_exb_h;

@@ -112,7 +112,7 @@ static inline tgk_vc2 tgk_vc2_fma_real(tgk_vc2 acc, float s, tgk_vc2 a) {
 /* Multiply by i * [s0, s1]: i*(re + i*im) = (-im + i*re) */
 static inline tgk_vc2 tgk_vc2_mul_is2(float s0, float s1, tgk_vc2 a) {
 #if defined(__ARM_FEATURE_COMPLEX)
-    float32x4_t sv = {s0, 0.0f, s1, 0.0f};
+    float32x4_t sv = {0.0f, s0, 0.0f, s1}; /* i*s: rot90 reads only the imaginary lanes */
     float32x4_t zero = vdupq_n_f32(0.0f);
     return vcmlaq_rot90_f32(zero, sv, a);
 #else
@@ -124,7 +124,7 @@ static inline tgk_vc2 tgk_vc2_mul_is2(float s0, float s1, tgk_vc2 a) {
 
 static inline tgk_vc2 tgk_vc2_fma_is2(tgk_vc2 acc, float s0, float s1, tgk_vc2 a) {
 #if defined(__ARM_FEATURE_COMPLEX)
-    float32x4_t sv = {s0, 0.0f, s1, 0.0f};
+    float32x4_t sv = {0.0f, s0, 0.0f, s1}; /* i*s: rot90 reads only the imaginary lanes */
     return vcmlaq_rot90_f32(acc, sv, a);
 #else
     float32x4_t rev = vrev64q_f32(a);
