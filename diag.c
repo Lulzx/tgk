@@ -94,17 +94,22 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
     double *slab_q  = calloc((size_t)nspecies * nmu, sizeof(double));
     double *slab_g  = calloc((size_t)nspecies * nmu, sizeof(double));
     double *slab_co = calloc((size_t)nspecies * nmu, sizeof(double));
+    double *slab_hd = calloc((size_t)nspecies * nmu, sizeof(double));
+    const double hyp_z    = p->hyper_z / 16.0; /* must match rhs.c */
 
     for (int s = 0; s < nspecies; s++) {
         const tgk_species_param *sp = &p->spec[s];
         double ns   = sp->dens;
         double ts   = sp->temp;
         double vths = sqrt(ts / sp->mass);
+        double z_t  = sp->charge / ts;
+        /* IMEX electrons skip explicit streaming and its hyperdiffusion (see rhs.c) */
+        const int has_hypz = (hyp_z > 0.0) && !(p->imex && sp->charge < 0.0);
 
         for (int imu = 0; imu < nmu; imu++) {
             double mu = gr->mu[imu];
             const tgk_real *j0_sm = gr->j0 + ((size_t)s * nmu + imu) * nfield;
-            double fe_acc = 0.0, q_acc = 0.0, g_acc = 0.0, co_acc = 0.0;
+            double fe_acc = 0.0, q_acc = 0.0, g_acc = 0.0, co_acc = 0.0, hd_acc = 0.0;
 
             for (int iv = 0; iv < nv; iv++) {
                 double vpar  = gr->vpar[iv];
@@ -137,6 +142,27 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
                             fe_acc += dfe;
                             co_acc -= 2.0 * sp->nu * dfe;
 
+                            /* Exact power of the z-hyperdiffusion operator in the free-energy norm:
+                             * sum (n T / F0) Re[ conj(h + Z/T F0 chi) * c_hypz * d4h ] */
+                            if (has_hypz) {
+                                tgk_complex hm2 = tgk_fetch_z_ts(gr, h_slab, iz - 2, iky, ikx);
+                                tgk_complex hm1 = tgk_fetch_z_ts(gr, h_slab, iz - 1, iky, ikx);
+                                tgk_complex hp1 = tgk_fetch_z_ts(gr, h_slab, iz + 1, iky, ikx);
+                                tgk_complex hp2 = tgk_fetch_z_ts(gr, h_slab, iz + 2, iky, ikx);
+                                double d4_re = (double)hm2.re - 4.0 * hm1.re + 6.0 * hk.re - 4.0 * hp1.re + hp2.re;
+                                double d4_im = (double)hm2.im - 4.0 * hm1.im + 6.0 * hk.im - 4.0 * hp1.im + hp2.im;
+                                double c_hypz = -hyp_z * fabs(vths * vpar * gm->gradpar[iz]) / gm->dz;
+                                double cx_re = (double)ph.re, cx_im = (double)ph.im;
+                                if (has_apar) {
+                                    cx_re -= (double)v_fac * ctx->apar[z_off + k].re;
+                                    cx_im -= (double)v_fac * ctx->apar[z_off + k].im;
+                                }
+                                double H_re = hk.re + z_t * f0 * j0_val * cx_re;
+                                double H_im = hk.im + z_t * f0 * j0_val * cx_im;
+                                hd_acc += ns * ts * w_vel * inv_f0 * m_fac * wz * c_hypz *
+                                          (H_re * d4_re + H_im * d4_im);
+                            }
+
                             if (iky > 0) {
                                 /* Radial ExB velocity v_ExB_x = -dchi/dy = -i * ky * chi
                                  * Flux = Re[ (-i * ky * chi)^* * h_s ] = ky * (chi.im * h.re - chi.re * h.im) */
@@ -161,6 +187,7 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
             slab_q[sm_idx]  = q_acc;
             slab_g[sm_idx]  = g_acc;
             slab_co[sm_idx] = co_acc;
+            slab_hd[sm_idx] = hd_acc;
         }
     }
 
@@ -204,7 +231,7 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
 
     out->free_energy = tgk_pairwise_sum_f64(slab_fe, (size_t)nspecies * nmu) + fe_field;
     out->fe_coll     = tgk_pairwise_sum_f64(slab_co, (size_t)nspecies * nmu);
-    out->fe_dissip   = -p->hyper_z * out->free_energy;
+    out->fe_dissip   = tgk_pairwise_sum_f64(slab_hd, (size_t)nspecies * nmu);
 
     if (dt_diag > 1e-12) {
         double dfe_dt = (out->free_energy - ctx->prev_free_energy) / dt_diag;
@@ -222,6 +249,7 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
     free(slab_q);
     free(slab_g);
     free(slab_co);
+    free(slab_hd);
 }
 
 void tgk_diag_write_trace(tgk_ctx *ctx, FILE *fp, const tgk_diag_out *d) {

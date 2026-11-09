@@ -61,7 +61,6 @@ typedef struct {
     int nonlinear;      /* 1 to include ExB nonlinearity, 0 for linear run */
     int imex;           /* 1 to enable implicit electron streaming + collisions */
     double hyper_z;     /* fourth-order parallel hyperdiffusion coefficient */
-    double hyper_v;     /* fourth-order v_parallel hyperdiffusion coefficient */
 
     /* Time integration & run control */
     int nsteps;
@@ -296,6 +295,27 @@ void tgk_coll_step_all(tgk_ctx *ctx, tgk_complex *h_inout, double dt);
 int  tgk_imex_init(tgk_ctx *ctx);
 void tgk_imex_free(tgk_ctx *ctx);
 void tgk_imex_solve_electrons(tgk_ctx *ctx, tgk_complex *h_inout, double dt);
+
+/* Fetch a plane element at (iz_target, iky, ikx) applying twist-and-shift boundary condition
+ * when iz_target crosses the ends of the flux tube [0, nz-1]. */
+static inline tgk_complex tgk_fetch_z_ts(const tgk_grid *gr, const tgk_complex *slab_base,
+                                     int iz_target, int iky, int ikx) {
+    const int nz  = gr->nz;
+    const int nkx = gr->nkx;
+    const int nky = gr->nky;
+
+    if ((unsigned)iz_target < (unsigned)nz) {
+        return slab_base[((size_t)iz_target * nky + iky) * nkx + ikx];
+    } else if (iz_target < 0) {
+        int ikx_conn = gr->ts_minus[(size_t)iky * nkx + ikx];
+        if (ikx_conn < 0) return (tgk_complex){0.0f, 0.0f};
+        return slab_base[((size_t)(iz_target + nz) * nky + iky) * nkx + ikx_conn];
+    } else {
+        int ikx_conn = gr->ts_plus[(size_t)iky * nkx + ikx];
+        if (ikx_conn < 0) return (tgk_complex){0.0f, 0.0f};
+        return slab_base[((size_t)(iz_target - nz) * nky + iky) * nkx + ikx_conn];
+    }
+}
 
 /* diag.c */
 typedef struct {

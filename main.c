@@ -74,7 +74,6 @@ int tgk_param_defaults(tgk_param *p) {
     p->nonlinear           = 1;
     p->imex                = 0;
     p->hyper_z             = 0.15;
-    p->hyper_v             = 0.02;
 
     p->nsteps              = 500;
     p->dt_max              = 0.05;
@@ -185,7 +184,6 @@ int tgk_param_parse_file(tgk_param *p, const char *filename) {
         else if (strcmp(key, "nonlinear") == 0)           p->nonlinear = atoi(val);
         else if (strcmp(key, "imex") == 0)                p->imex = atoi(val);
         else if (strcmp(key, "hyper_z") == 0)             p->hyper_z = atof(val);
-        else if (strcmp(key, "hyper_v") == 0)             p->hyper_v = atof(val);
         else if (strcmp(key, "nsteps") == 0)              p->nsteps = atoi(val);
         else if (strcmp(key, "dt_max") == 0)              p->dt_max = atof(val);
         else if (strcmp(key, "cfl_frac") == 0)            p->cfl_frac = atof(val);

@@ -2,27 +2,6 @@
 #include <stdatomic.h>
 #include <string.h>
 
-/* Fetch a plane element at (iz_target, iky, ikx) applying twist-and-shift boundary condition
- * when iz_target crosses the ends of the flux tube [0, nz-1]. */
-static inline tgk_complex fetch_z_ts(const tgk_grid *gr, const tgk_complex *slab_base,
-                                     int iz_target, int iky, int ikx) {
-    const int nz  = gr->nz;
-    const int nkx = gr->nkx;
-    const int nky = gr->nky;
-
-    if ((unsigned)iz_target < (unsigned)nz) {
-        return slab_base[((size_t)iz_target * nky + iky) * nkx + ikx];
-    } else if (iz_target < 0) {
-        int ikx_conn = gr->ts_minus[(size_t)iky * nkx + ikx];
-        if (ikx_conn < 0) return (tgk_complex){0.0f, 0.0f};
-        return slab_base[((size_t)(iz_target + nz) * nky + iky) * nkx + ikx_conn];
-    } else {
-        int ikx_conn = gr->ts_plus[(size_t)iky * nkx + ikx];
-        if (ikx_conn < 0) return (tgk_complex){0.0f, 0.0f};
-        return slab_base[((size_t)(iz_target - nz) * nky + iky) * nkx + ikx_conn];
-    }
-}
-
 /* Fetch gyroaveraged potential chi = J0 * (phi - v_th * vpar * apar) at (iz_target, iky, ikx)
  * with twist-and-shift boundary conditions. */
 static inline tgk_complex fetch_chi_ts(const tgk_grid *gr, const tgk_complex *phi,
@@ -469,10 +448,10 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
 
                     /* 2. Parallel streaming & fourth-order z hyperdiffusion with twist-and-shift */
                     if (!skip_par_stream) {
-                        tgk_complex hm2 = fetch_z_ts(gr, h_slab, iz - 2, iky, ikx);
-                        tgk_complex hm1 = fetch_z_ts(gr, h_slab, iz - 1, iky, ikx);
-                        tgk_complex hp1 = fetch_z_ts(gr, h_slab, iz + 1, iky, ikx);
-                        tgk_complex hp2 = fetch_z_ts(gr, h_slab, iz + 2, iky, ikx);
+                        tgk_complex hm2 = tgk_fetch_z_ts(gr, h_slab, iz - 2, iky, ikx);
+                        tgk_complex hm1 = tgk_fetch_z_ts(gr, h_slab, iz - 1, iky, ikx);
+                        tgk_complex hp1 = tgk_fetch_z_ts(gr, h_slab, iz + 1, iky, ikx);
+                        tgk_complex hp2 = tgk_fetch_z_ts(gr, h_slab, iz + 2, iky, ikx);
 
                         tgk_complex cm2 = fetch_chi_ts(gr, ctx->phi, ctx->apar, j0_sm, v_fac, has_apar, iz - 2, iky, ikx);
                         tgk_complex cm1 = fetch_chi_ts(gr, ctx->phi, ctx->apar, j0_sm, v_fac, has_apar, iz - 1, iky, ikx);

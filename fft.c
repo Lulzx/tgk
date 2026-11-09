@@ -36,6 +36,15 @@ static tgk_complex *make_twiddles(int n, int inv) {
     return tw;
 }
 
+/* Number of stored non-negative kx modes that enter physical space: 0 .. half_x for odd nkx,
+ * 0 .. half_x - 1 for even nkx. The even-nkx Nyquist column (ikx = nkx/2) has no -kx partner,
+ * so it cannot be part of a real field; it is excluded from every C2R input and zeroed in every
+ * R2C output, which keeps the dealiased E x B bracket exactly energy-conserving. */
+static inline int tgk_fft_npos(int nkx) {
+    if (nkx <= 1) return 1;
+    return (nkx & 1) ? (nkx / 2 + 1) : (nkx / 2);
+}
+
 int tgk_fft_init(tgk_fft_plan *plan, int nkx, int nky) {
     memset(plan, 0, sizeof(*plan));
     plan->nkx = nkx;
@@ -368,11 +377,12 @@ void tgk_fft_1d_c2c(tgk_complex *in, tgk_complex *out, int n, int inv) {
  * Given a single spectral field F(kx, ky), computes both real_df_dx = dF/dx(x, y) and
  * real_df_dy = dF/dy(x, y) in physical space on the padded (dealiased) grid.
  *
- * Key insight:
- *   - Step 1: Only (2 * nky - 1) 1D x-FFTs of length nx_pad (for ky=0..nky-1 of i*kx*F,
- *     and ky=1..nky-1 of F scaled by i*ky afterwards).
- *   - Step 2: Pack dF/dx(x, ky) + i * dF/dy(x, ky) into ONE 1D y-FFT of length ny_pad per ix.
- * Total: 63 x-FFTs + 192 y-FFTs! */
+ * Step 1: (2 * nky - 1) x-FFTs of length nx_pad: i*kx*F for every ky, and F for ky >= 1,
+ *         scaled by i*ky after the transform (i*ky is constant in x). The ky = 0 row of
+ *         dF/dy is identically zero.
+ * Step 2: dF/dx + i*dF/dy are both real in physical space, so they are packed into one
+ *         Hermitian-combined spectrum and recovered with a single y-FFT per x
+ *         (nx_pad y-FFTs of length ny_pad). */
 void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spec_f,
                                 const double *kx, const double *ky,
                                 tgk_real *real_df_dx, tgk_real *real_df_dy,
@@ -382,7 +392,7 @@ void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
     const int nx_pad = plan->nx_pad;
     const int ny_pad = plan->ny_pad;
     const int half_x = nkx / 2;
-    const int n_pos  = (nkx > 1) ? (half_x + 1) : 1;
+    const int n_pos  = tgk_fft_npos(nkx);
 
     tgk_complex *row_in  = scratch2;
     tgk_complex *row_out = scratch2 + nx_pad + ny_pad;
@@ -452,8 +462,8 @@ void tgk_fft_c2r_grad_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
     }
 }
 
-/* Paired 2D Real-to-Complex analysis for two real fields real_a(x,y) and real_b(x,y) simultaneously
- * (e.g. Poisson bracket at z=iz and z=iz+1), cutting 1D y-FFTs in half! */
+/* Paired 2D real-to-complex analysis of two real fields real_a(x, y) and real_b(x, y) at once
+ * (e.g. Poisson brackets at z = iz and z = iz + 1), halving the number of 1D y-FFTs. */
 void tgk_fft_r2c_pair_dealiased(const tgk_fft_plan *plan, const tgk_real *real_a,
                                 const tgk_real *real_b, tgk_complex *spec_a, tgk_complex *spec_b,
                                 tgk_complex *scratch1, tgk_complex *scratch2) {
@@ -462,7 +472,7 @@ void tgk_fft_r2c_pair_dealiased(const tgk_fft_plan *plan, const tgk_real *real_a
     const int nx_pad = plan->nx_pad;
     const int ny_pad = plan->ny_pad;
     const int half_x = nkx / 2;
-    const int n_pos  = (nkx > 1) ? (half_x + 1) : 1;
+    const int n_pos  = tgk_fft_npos(nkx);
     const tgk_real scale = (tgk_real)plan->norm;
 
     tgk_complex *row_in  = scratch2;
@@ -544,21 +554,13 @@ void tgk_fft_c2r_pair_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
     tgk_complex *row_tmp = row_out  + nx_pad + ny_pad;
     tgk_complex *scr_b   = scratch1 + (size_t)nx_pad * nky;
 
-    /* Step 1: For each pair of ky modes (iky, iky+1), run TWO 1D inverse FFTs in x simultaneously
-     * by packing them or running back-to-back with shared twiddles, and derive BOTH
-     * dF/dx(x, ky) = FFT_x^{-1}[i*kx*F] and dF/dy(x, ky) = i*ky * FFT_x^{-1}[F]!
-     * Wait: notice that for dF/dy, the factor i*ky does NOT depend on kx at all!
-     * That means if we know F(kx, ky), then dF/dy(x, ky) = i * ky * F(x, ky),
-     * AND if we instead transform F(kx, ky) in x first (just ONE 1D x-FFT of length nx_pad per ky!),
-     * or if we transform F(kx, ky) and i*kx*F(kx, ky), can we get dF/dx from F(x, ky)?
-     * Even better: in `tgk_fft_c2r_grad_dealiased`, the input is a single complex spectrum F(kx, ky),
-     * and we want BOTH real_dx = dF/dx(x,y) and real_dy = dF/dy(x,y)!
-     * Since i*ky is constant in x, FFT_x^{-1}[i*ky * F(kx, ky)] = i*ky * FFT_x^{-1}[F(kx, ky)]!
-     * Wait — what if we do the 1D y-FFT FIRST (only nkx 1D FFTs of length ny_pad!), and the 1D x-FFT SECOND? */
+    /* Step 1: for each ky, inverse-FFT spec_a and spec_b along x (zero-padded to nx_pad) and
+     * store them transposed, scratch1[ix * nky + iky] and scr_b[ix * nky + iky], so the y
+     * transform in step 2 reads contiguous memory. */
     for (int iky = 0; iky < nky; iky++) {
         const tgk_complex *sa = spec_a + (size_t)iky * nkx;
         const tgk_complex *sb = spec_b + (size_t)iky * nkx;
-        int n_pos = (nkx > 1) ? (half_x + 1) : 1;
+        int n_pos = tgk_fft_npos(nkx);
 
         memset(row_in, 0, sizeof(tgk_complex) * nx_pad);
         for (int ikx = 0; ikx < n_pos; ikx++) row_in[ikx] = sa[ikx];
@@ -574,7 +576,7 @@ void tgk_fft_c2r_pair_dealiased(const tgk_fft_plan *plan, const tgk_complex *spe
     }
 
     /* Step 2: For each x in [0, nx_pad-1], combine A(x, ky) + i * B(x, ky) into a single
-     * 1D inverse FFT of length ny_pad, producing real_a(x, y) = Re and real_b(x, y) = Im! */
+     * 1D inverse FFT of length ny_pad, producing real_a(x, y) = Re and real_b(x, y) = Im. */
     for (int ix = 0; ix < nx_pad; ix++) {
         const tgk_complex *ca = scratch1 + (size_t)ix * nky;
         const tgk_complex *cb = scr_b    + (size_t)ix * nky;
@@ -626,8 +628,8 @@ void tgk_fft_c2r_dealiased(const tgk_fft_plan *plan, const tgk_complex *spec_in,
         const tgk_complex *src_ky = spec_in + (size_t)iky * nkx;
         memset(row_in, 0, sizeof(tgk_complex) * nx_pad);
 
-        /* Non-negative kx: 0 .. half_x */
-        int n_pos = (nkx > 1) ? (half_x + 1) : 1;
+        /* Non-negative kx (Nyquist column excluded, see tgk_fft_npos) */
+        int n_pos = tgk_fft_npos(nkx);
         for (int ikx = 0; ikx < n_pos; ikx++) {
             row_in[ikx] = src_ky[ikx];
         }
@@ -687,16 +689,13 @@ void tgk_fft_c2r_dealiased(const tgk_fft_plan *plan, const tgk_complex *spec_in,
     }
 }
 
-/* 2D Real-to-Complex analysis with folded 2/3-rule truncation & normalization (x-first algorithm!):
+/* 2D real-to-complex analysis with folded 2/3-rule truncation and normalization (x first):
  * Input:  real_in[nx_pad][ny_pad]
  * Output: spec_out[nky][nkx]
  *
- * Key insight: By transforming along x FIRST (pairing two y-columns iy and iy+1 into a single
- * complex 1D x-FFT of length nx_pad, and immediately truncating to the nkx dealiased modes!),
- * we only need:
- *   - ny_pad / 2  1D x-FFTs of length nx_pad (48 instead of 64!)
- *   - nkx / 2     1D y-FFTs of length ny_pad (64 instead of 96!)
- * Total 1D FFTs for 2D R2C drops from 128 down to 112! */
+ * Two real y-columns (iy, iy + 1) are packed into one complex x-FFT of length nx_pad and the
+ * result is truncated to the nkx dealiased modes immediately, so only ny_pad / 2 x-FFTs and
+ * nkx / 2 y-FFTs of length ny_pad are needed. */
 void tgk_fft_r2c_dealiased(const tgk_fft_plan *plan, const tgk_real *real_in,
                            tgk_complex *spec_out, tgk_complex *scratch1, tgk_complex *scratch2) {
     const int nkx    = plan->nkx;
@@ -711,7 +710,7 @@ void tgk_fft_r2c_dealiased(const tgk_fft_plan *plan, const tgk_real *real_in,
     tgk_complex *row_tmp = row_out  + nx_pad + ny_pad;
 
     /* Step 1: Forward 1D FFT along x for pairs of y-columns (iy, iy+1),
-     * storing only the nkx dealiased kx modes into scratch1[ikx * ny_pad + iy]! */
+     * storing only the nkx dealiased kx modes into scratch1[ikx * ny_pad + iy]. */
     for (int iy = 0; iy < ny_pad; iy += 2) {
         for (int ix = 0; ix < nx_pad; ix++) {
             const tgk_real *col = real_in + (size_t)ix * ny_pad + iy;
@@ -754,11 +753,11 @@ void tgk_fft_r2c_dealiased(const tgk_fft_plan *plan, const tgk_real *real_in,
     }
 
     /* Step 2: Now notice that for each ikx in [0 .. (nkx+1)/2 - 1],
-     * scratch1[ikx * ny_pad + iy] is F(+kx, y), and F(-kx, y) = conj(F(+kx, y))!
+     * scratch1[ikx * ny_pad + iy] is F(+kx, y), and F(-kx, y) = conj(F(+kx, y)).
      * That means a SINGLE 1D forward y-FFT of F(+kx, y) gives BOTH:
      *   - F(+kx, +ky) = scale * row_out[iky]           (for iky = 0 .. nky-1)
-     *   - F(-kx, +ky) = scale * conj(row_out[ny_pad - iky]) (for iky = 1 .. nky-1)!
-     * We only need (nkx / 2) 1D y-FFTs TOTAL instead of nkx! */
+     *   - F(-kx, +ky) = scale * conj(row_out[ny_pad - iky]) (for iky = 1 .. nky-1).
+     * We only need (nkx / 2) 1D y-FFTs TOTAL instead of nkx. */
     /* 2a: ikx = 0 */
     fft_1d_stockham(scratch1, row_out, row_tmp, ny_pad, plan->tw_y_fwd, 0);
     spec_out[0] = (tgk_complex){0.0f, 0.0f};
