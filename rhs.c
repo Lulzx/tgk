@@ -128,6 +128,21 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
         const tgk_complex *h_vp1 = (iv + 1 < nv) ? (h_slab + 1 * nfield) : NULL;
         const tgk_complex *h_vp2 = (iv + 2 < nv) ? (h_slab + 2 * nfield) : NULL;
 
+        /* Streaming and mirror are discretized on u = h / sqrt(F0), the variable in which
+         * the free-energy norm (|h|^2 / F0) is unweighted:
+         *   v dh/dz       -> v sqrt(F0) d/dz (h / sqrt(F0)) + (v mu B'/2) h
+         *   mu B' dh/dv   -> mu B' sqrt(F0) d/dv (h / sqrt(F0)) - (v mu B'/2) h
+         * The two local terms cancel exactly, leaving centered stencils on u with neighbor
+         * factors sqrt(F0(here)/F0(neighbor)). Each stencil is then antisymmetric in the
+         * energy norm, including at the v_par boundaries where 1/F0 ~ exp(v^2/2) is large,
+         * so neither term can create free energy. The v factors depend only on iv,
+         * the z factors exp(-mu (B(z) - B(z')) / 2) only on (imu, iz). */
+        const double dvg = gr->dv;
+        const tgk_real mr_m2 = (tgk_real)exp(((vpar - 2.0 * dvg) * (vpar - 2.0 * dvg) - vpar * vpar) * 0.25);
+        const tgk_real mr_m1 = (tgk_real)exp(((vpar - 1.0 * dvg) * (vpar - 1.0 * dvg) - vpar * vpar) * 0.25);
+        const tgk_real mr_p1 = (tgk_real)exp(((vpar + 1.0 * dvg) * (vpar + 1.0 * dvg) - vpar * vpar) * 0.25);
+        const tgk_real mr_p2 = (tgk_real)exp(((vpar + 2.0 * dvg) * (vpar + 2.0 * dvg) - vpar * vpar) * 0.25);
+
         const double q_fac = zs * ns;
         const double a_fac = 0.5 * p->beta * zs * ns * vths * vpar;
 
@@ -271,9 +286,17 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
             const tgk_real    *j0_z   = j0_sm     + z_off;
             tgk_complex64     *qn_z   = ws->qn_num_loc  + z_off;
             tgk_complex64     *am_z   = ws->amp_num_loc + z_off;
+            const int has_mirror      = (fabs(c_mirror) > 1e-18f);
+            const tgk_real c_mir_m2   = c_mirror * mr_m2;
+            const tgk_real c_mir_m1   = c_mirror * mr_m1;
+            const tgk_real c_mir_p1   = c_mirror * mr_p1;
+            const tgk_real c_mir_p2   = c_mirror * mr_p2;
+            const tgk_real sz_m2 = (tgk_real)exp(-0.5 * mu * (b - gm->bmag[(iz - 2 + nz) % nz]));
+            const tgk_real sz_m1 = (tgk_real)exp(-0.5 * mu * (b - gm->bmag[(iz - 1 + nz) % nz]));
+            const tgk_real sz_p1 = (tgk_real)exp(-0.5 * mu * (b - gm->bmag[(iz + 1) % nz]));
+            const tgk_real sz_p2 = (tgk_real)exp(-0.5 * mu * (b - gm->bmag[(iz + 2) % nz]));
 #if TGK_HAS_NEON && !TGK_REAL_IS_FP64
             const int interior_z      = (iz >= 2 && iz < nz - 2);
-            const int has_mirror      = (fabs(c_mirror) > 1e-18f);
 #endif
 
             for (int iky = 0; iky < nky; iky++) {
@@ -349,10 +372,10 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                             tgk_vc2 cp1 = tgk_vc2_mul_real2(jz_p1[ikx], jz_p1[ikx + 1], pp1);
                             tgk_vc2 cp2 = tgk_vc2_mul_real2(jz_p2[ikx], jz_p2[ikx + 1], pp2);
 
-                            tgk_vc2 gm2 = tgk_vc2_fma_real(hm2, c_zt_f0, cm2);
-                            tgk_vc2 gm1 = tgk_vc2_fma_real(hm1, c_zt_f0, cm1);
-                            tgk_vc2 gp1 = tgk_vc2_fma_real(hp1, c_zt_f0, cp1);
-                            tgk_vc2 gp2 = tgk_vc2_fma_real(hp2, c_zt_f0, cp2);
+                            tgk_vc2 gm2 = tgk_vc2_fma_real(vmulq_n_f32(hm2, sz_m2), c_zt_f0, cm2);
+                            tgk_vc2 gm1 = tgk_vc2_fma_real(vmulq_n_f32(hm1, sz_m1), c_zt_f0, cm1);
+                            tgk_vc2 gp1 = tgk_vc2_fma_real(vmulq_n_f32(hp1, sz_p1), c_zt_f0, cp1);
+                            tgk_vc2 gp2 = tgk_vc2_fma_real(vmulq_n_f32(hp2, sz_p2), c_zt_f0, cp2);
 
                             tgk_vc2 dg_dz = vsubq_f32(gm2, gp2);
                             dg_dz = vfmaq_n_f32(dg_dz, vsubq_f32(gp1, gm1), 8.0f);
@@ -370,9 +393,10 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                             tgk_vc2 vp1 = h_vp1 ? tgk_vc2_load(h_vp1 + z_off + k) : tgk_vc2_zero();
                             tgk_vc2 vp2 = h_vp2 ? tgk_vc2_load(h_vp2 + z_off + k) : tgk_vc2_zero();
 
-                            tgk_vc2 dh_dv = vsubq_f32(vm2, vp2);
-                            dh_dv = vfmaq_n_f32(dh_dv, vsubq_f32(vp1, vm1), 8.0f);
-                            rhs = vfmaq_n_f32(rhs, dh_dv, c_mirror);
+                            rhs = vfmaq_n_f32(rhs, vm2, c_mir_m2);
+                            rhs = vfmsq_n_f32(rhs, vp2, c_mir_p2);
+                            rhs = vfmaq_n_f32(rhs, vp1, 8.0f * c_mir_p1);
+                            rhs = vfmsq_n_f32(rhs, vm1, 8.0f * c_mir_m1);
                         }
 
                         if (do_nl) {
@@ -458,11 +482,11 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         tgk_complex cp1 = fetch_chi_ts(gr, ctx->phi, ctx->apar, j0_sm, v_fac, has_apar, iz + 1, iky, ikx);
                         tgk_complex cp2 = fetch_chi_ts(gr, ctx->phi, ctx->apar, j0_sm, v_fac, has_apar, iz + 2, iky, ikx);
 
-                        /* g = h + (Z_s/T_s)*F0*chi along z */
-                        tgk_complex gm2 = {hm2.re + c_zt_f0 * cm2.re, hm2.im + c_zt_f0 * cm2.im};
-                        tgk_complex gm1 = {hm1.re + c_zt_f0 * cm1.re, hm1.im + c_zt_f0 * cm1.im};
-                        tgk_complex gp1 = {hp1.re + c_zt_f0 * cp1.re, hp1.im + c_zt_f0 * cp1.im};
-                        tgk_complex gp2 = {hp2.re + c_zt_f0 * cp2.re, hp2.im + c_zt_f0 * cp2.im};
+                        /* g = h + (Z_s/T_s)*F0*chi along z, h neighbors in the sqrt(F0) form */
+                        tgk_complex gm2 = {sz_m2 * hm2.re + c_zt_f0 * cm2.re, sz_m2 * hm2.im + c_zt_f0 * cm2.im};
+                        tgk_complex gm1 = {sz_m1 * hm1.re + c_zt_f0 * cm1.re, sz_m1 * hm1.im + c_zt_f0 * cm1.im};
+                        tgk_complex gp1 = {sz_p1 * hp1.re + c_zt_f0 * cp1.re, sz_p1 * hp1.im + c_zt_f0 * cp1.im};
+                        tgk_complex gp2 = {sz_p2 * hp2.re + c_zt_f0 * cp2.re, sz_p2 * hp2.im + c_zt_f0 * cp2.im};
 
                         /* 4th-order centered derivative: (-gp2 + 8*gp1 - 8*gm1 + gm2) / (12*dz) */
                         tgk_complex dg_dz = {
@@ -481,19 +505,18 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         rhs.im += c_hypz * d4h.im;
                     }
 
-                    /* 3. Mirror force term along v_parallel (4th-order centered finite difference) */
-                    if (fabs(c_mirror) > 1e-18f) {
+                    /* 3. Mirror force along v_parallel: 4th-order centered stencil on h/sqrt(F0)
+                     *    plus the local -(v/2) h term (see the mr_* factors above) */
+                    if (has_mirror) {
                         tgk_complex v_m2 = h_vm2 ? h_vm2[z_off + k] : (tgk_complex){0.0f, 0.0f};
                         tgk_complex v_m1 = h_vm1 ? h_vm1[z_off + k] : (tgk_complex){0.0f, 0.0f};
                         tgk_complex v_p1 = h_vp1 ? h_vp1[z_off + k] : (tgk_complex){0.0f, 0.0f};
                         tgk_complex v_p2 = h_vp2 ? h_vp2[z_off + k] : (tgk_complex){0.0f, 0.0f};
 
-                        tgk_complex dh_dv = {
-                            -v_p2.re + 8.0f * v_p1.re - 8.0f * v_m1.re + v_m2.re,
-                            -v_p2.im + 8.0f * v_p1.im - 8.0f * v_m1.im + v_m2.im
-                        };
-                        rhs.re += c_mirror * dh_dv.re;
-                        rhs.im += c_mirror * dh_dv.im;
+                        rhs.re += c_mir_m2 * v_m2.re - c_mir_p2 * v_p2.re
+                                + 8.0f * (c_mir_p1 * v_p1.re - c_mir_m1 * v_m1.re);
+                        rhs.im += c_mir_m2 * v_m2.im - c_mir_p2 * v_p2.im
+                                + 8.0f * (c_mir_p1 * v_p1.im - c_mir_m1 * v_m1.im);
                     }
 
                     /* 4. Nonlinear E x B term */

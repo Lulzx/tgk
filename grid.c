@@ -177,9 +177,10 @@ int tgk_grid_init(const tgk_param *p, const tgk_geom *g, tgk_grid *gr) {
     double v_norm = 0.0;
     for (int iv = 0; iv < gr->nv; iv++) {
         gr->vpar[iv] = -vmax + (double)iv * gr->dv;
-        /* Composite Simpson / spectral-accurate trapezoidal rule on [-vmax, vmax] */
+        /* Uniform weights (rectangle rule; spectrally accurate for the Gaussian-decayed
+         * integrands on [-vmax, vmax]). Uniform weights are required for the mirror
+         * stencil in rhs.c to be exactly energy-neutral at the v_par boundaries. */
         double w = gr->dv;
-        if (iv == 0 || iv == gr->nv - 1) w *= 0.5;
         gr->w_v[iv] = w;
         v_norm += w * exp(-0.5 * gr->vpar[iv] * gr->vpar[iv]) / sqrt(2.0 * M_PI);
     }

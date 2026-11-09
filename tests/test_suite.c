@@ -376,7 +376,8 @@ static void test_rosenbluth_hinton(void) {
 /* 4. Nonlinear Cyclone Base Case saturation
  * Small grid run to t = 200; turbulence saturates at t ~ 110. Checks that the ion heat flux
  * is outward at every sample of the saturated window, that the window is statistically
- * steady, and that chi_i is of the published order (~1-3 rho_i^2 v_ti / a). */
+ * steady, that chi_i is of the published order (~1-3 rho_i^2 v_ti / a), and that the
+ * free-energy balance closes in turbulence (drive = dissipation on average). */
 static void test_nonlinear_saturation(void) {
     printf("\n--- Test 4: Nonlinear Cyclone Base Case Saturation ---\n");
     tgk_param p;
@@ -394,7 +395,7 @@ static void test_nonlinear_saturation(void) {
     tgk_ctx_init(&ctx, &p);
     tgk_init_perturbation(&ctx);
 
-    double q_min = 1e300, chi_sum = 0.0, q_a = 0.0, q_b = 0.0;
+    double q_min = 1e300, chi_sum = 0.0, q_a = 0.0, q_b = 0.0, drive_sum = 0.0, res_sum = 0.0;
     int n = 0, n_a = 0, n_b = 0;
     while (ctx.time < 200.0) {
         tgk_step_rk4(&ctx);
@@ -403,6 +404,8 @@ static void test_nonlinear_saturation(void) {
             tgk_diag_compute(&ctx, ctx.h, &d);
             if (d.heat_flux_i < q_min) q_min = d.heat_flux_i;
             chi_sum += d.chi_i;
+            drive_sum += d.fe_drive;
+            res_sum   += d.fe_residual;
             n++;
             if (ctx.time < 165.0) { q_a += d.heat_flux_i; n_a++; }
             else                  { q_b += d.heat_flux_i; n_b++; }
@@ -418,6 +421,9 @@ static void test_nonlinear_saturation(void) {
           "Saturated state is steady: <Q_i>[130,165] = %.3f, <Q_i>[165,200] = %.3f", qa, qb);
     CHECK(chi > 0.5 && chi < 6.0,
           "Nonlinear Cyclone ion diffusivity chi_i = %.3f rho_i^2 v_ti / a", chi);
+    double rel_res = fabs(res_sum) / fmax(fabs(drive_sum), 1e-300);
+    CHECK(rel_res < 0.1,
+          "Nonlinear free-energy balance closes: <residual> / <drive> = %.4f", rel_res);
 }
 
 /* 5. Collisional conservation (density, momentum, energy) & Checkpoint bit-identical restart */

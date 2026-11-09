@@ -58,7 +58,8 @@ Validation
 - Linear Cyclone Base Case: gamma = 0.096, omega = -0.28 at ky rho = 0.3
   (published: ~0.1 v_ti/a). Free-energy decay below threshold. Miller
   circular limit equal to s-alpha.
-- Linear free-energy balance closes to within 5%.
+- Free-energy balance closes: to about 1% in the linear phase and 2% on
+  average in saturated turbulence.
 - Rosenbluth-Hinton zonal flow residual within 30% of the analytic value.
 - Nonlinear Cyclone saturation: outward heat flux, chi_i ~ 1.8 rho^2 v_t/a.
 - Collisional conservation, checkpoint restart.
@@ -75,13 +76,14 @@ The fused stage kernel reaches about 13 GB/s, far below the memory
 bandwidth of the machine; it is limited by compute and FFT latency, not
 by memory traffic.
 
-Known issues
-------------
+Discretization notes
+--------------------
 
-In saturated nonlinear turbulence the free-energy balance does not close:
-the measured hyperdiffusion exceeds the gradient drive by about 3x and the
-gap grows as `hyper_z` is reduced. It does not depend on the time step. The
-E x B bracket itself conserves energy exactly. The linear balance closes.
+Parallel streaming and the mirror force are discretized on h/sqrt(F0), the
+variable in which the free energy is an unweighted norm. Their compressional
+terms then cancel exactly and the remaining centered stencils cannot create
+energy, including near v_max where 1/F0 is large. The even-nkx Nyquist kx
+column is excluded from the E x B bracket, which conserves energy exactly.
 
 Files
 -----
