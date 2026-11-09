@@ -1,0 +1,46 @@
+# Cyclone Base Case — Nonlinear Adiabatic-Electron Input
+# Reference: Dimits et al., Phys. Plasmas 7, 969 (2000)
+
+nkx                 = 64
+nky                 = 16
+nz                  = 24
+nv                  = 32
+nmu                 = 8
+nspecies            = 1
+
+ky_min              = 0.05
+z_period            = 1.0
+vmax                = 3.5
+
+geometry            = s-alpha
+q0                  = 1.4
+shat                = 0.796
+eps                 = 0.18
+rmaj                = 2.77778
+alpha_mhd           = 0.0
+
+adiabatic_electrons = 1
+tau_e               = 1.0
+beta                = 0.0
+nonlinear           = 1
+imex                = 0
+hyper_z             = 0.15
+
+nsteps              = 200
+dt_max              = 0.05
+cfl_frac            = 0.85
+t_max               = 100.0
+nprint              = 20
+nsnap               = 0
+ncheck              = 0
+init_amp            = 0.01
+out_prefix          = cbc_nl
+
+spec0.name          = deuterium
+spec0.charge        = 1.0
+spec0.mass          = 1.0
+spec0.dens          = 1.0
+spec0.temp          = 1.0
+spec0.fprim         = 2.22
+spec0.tprim         = 6.92
+spec0.nu            = 0.002

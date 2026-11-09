@@ -1,0 +1,21 @@
+# Spec files
+SPEC.md
+*spec*.md
+
+# Build binaries
+tgk
+tgk_fp64
+tests/test_suite
+tests/test_suite_fp64
+
+# Run outputs, snapshots, and checkpoints
+*.trace.txt
+*.bin
+tests/*.bin
+tests/prec_check.in
+tests/prec_run*
+
+# macOS / editor artifacts
+.DS_Store
+*.dSYM/
+*.o
