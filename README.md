@@ -9,15 +9,18 @@ instructions) but builds with any C99 compiler.
 Features
 --------
 
-- Electrostatic and electromagnetic (A_par) turbulence, adiabatic or kinetic
-  electrons. ITG, TEM and KBM regimes.
+- Electrostatic ITG and TEM turbulence with adiabatic or kinetic electrons,
+  validated against GS2 and GX (see `validation/`). Electromagnetic (A_par)
+  terms are implemented but NOT validated: kinetic-electron EM runs have a
+  known spurious instability.
 - Pseudo-spectral (kx, ky) with 2/3-rule dealiasing; custom mixed-radix
   (2, 3, 4, 5) Stockham FFTs.
 - 4th order finite differences in z and v_par, twist-and-shift boundary
   condition, Gauss-Laguerre quadrature in mu.
-- s-alpha and Miller local equilibrium geometry.
-- RK4 with adaptive CFL time step. Optional implicit (IMEX) parallel
-  streaming for kinetic electrons.
+- s-alpha and Miller local equilibrium geometry (Bishop's method; matches
+  GS2's `eik` to within 1%).
+- RK4 with adaptive CFL time step. The optional implicit (IMEX) parallel
+  streaming for kinetic electrons is known to be wrong; do not use it.
 - Linearized Dougherty collision operator with discrete conservation of
   density, momentum and energy.
 - FP32 state with FP64 field reductions, or full FP64 (`tgk_fp64`).
@@ -34,7 +37,7 @@ Usage
 -----
 
     ./tgk tests/cyclone_nonlinear.in
-    ./tgk tests/kinetic_em.in
+    ./tgk tests/kinetic_em.in        # EM kinetic electrons: unvalidated, see below
 
 Input files are plain `key = value` lists; see the files in `tests/`.
 Output is a text trace (`<prefix>.trace.txt`) with time, |phi|^2, fluxes,
@@ -51,17 +54,35 @@ R/L_n and R/L_T; `rmaj` is R/a.
 Validation
 ----------
 
+`validation/README.md` has the full comparison against GS2 and GX on the
+Cyclone Base Case, with tables, plots and scripts. In summary:
+
+- Linear s-alpha CBC (adiabatic electrons): at kyρ ≤ 0.45, γ agrees with GS2
+  and GX to within 2–4% and ω to within about 1%. At kyρ = 0.3, TGK gives
+  γ = 0.0936 and ω = 0.282; GX gives 0.0930 and 0.282.
+- Miller geometry: metric and drift coefficients agree with GS2's `eik`
+  to within 1%. Elongation is stabilizing, as in GS2: peak γ is 0.141,
+  0.116 and 0.087 at κ = 1.0, 1.4 and 1.8 (GS2: 0.143, 0.118 and 0.088).
+- Kinetic electrons, electrostatic: γ agrees with GX to within 3–4% at
+  kyρ = 0.2–0.4.
+- Nonlinear CBC (s-alpha, GX parameters, ν = 0.002): χ_i ≈ 1.0–1.2 ρ² v_t/a
+  on grids from 32 × 16 to 128 × 32. The differences between grids are
+  within the statistical error.
+- Not validated: electromagnetic runs and the IMEX path (see above).
+
 `make check` tests:
 
 - FFT round trip, Parseval, and exact conservation of the dealiased E x B
   bracket.
-- Linear Cyclone Base Case: gamma = 0.096, omega = -0.28 at ky rho = 0.3
-  (published: ~0.1 v_ti/a). Free-energy decay below threshold. Miller
-  circular limit equal to s-alpha.
+- RK4 convergence order.
+- Linear CBC at kyρ = 0.3 against GX: s-alpha, circular Miller, and
+  electrostatic kinetic electrons. Also checks that elongation is
+  stabilizing and that a sub-critical case decays.
 - Free-energy balance closes: to about 1% in the linear phase and 2% on
   average in saturated turbulence.
 - Rosenbluth-Hinton zonal flow residual within 30% of the analytic value.
-- Nonlinear Cyclone saturation: outward heat flux, chi_i ~ 1.8 rho^2 v_t/a.
+- Nonlinear CBC saturation on a small grid (sanity bounds only; see
+  `validation/` for converged values).
 - Collisional conservation, checkpoint restart.
 - FP32 vs FP64: pointwise agreement in the linear phase, statistical
   agreement in saturated turbulence.

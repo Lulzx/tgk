@@ -53,6 +53,7 @@ typedef struct {
     double delta;       /* triangularity */
     double s_delta;     /* r ddelta/dr */
     double shift;       /* Shafranov shift dR0/dr */
+    double betaprim;    /* beta * dln(p)/drho (GS2 beta_prime_input), Miller only */
 
     /* Physics flags & parameters */
     int adiabatic_electrons; /* 1 if electrons are adiabatic, 0 if kinetic */
@@ -97,6 +98,9 @@ typedef struct {
     double *cv_y;       /* curvature + grad-B drift y component (multiply ky) */
     double *gb_x;       /* pure grad-B drift x component */
     double *gb_y;       /* pure grad-B drift y component */
+    double *grho;       /* |grad rho|, rho = r/a */
+    double grho_avg;    /* <|grad rho|> flux-surface average (flux normalization) */
+    double kxfac;       /* E x B bracket factor |q dpsi/drho / rho| (1 for s-alpha) */
     double *jac;        /* flux-tube Jacobian J(z) */
     double *z_weight;   /* normalized flux-surface average weights w_z, sum(w_z) = 1 */
 } tgk_geom;
@@ -203,7 +207,8 @@ struct tgk_ctx {
 
     /* 5D distribution function arrays [nspecies][nmu][nv][nz][nky][nkx] */
     tgk_complex *h;         /* current state h^n */
-    tgk_complex *h_stage;   /* intermediate stage state h^(s) */
+    tgk_complex *h_stage;   /* intermediate stage state h^(s), ping-pong buffer A */
+    tgk_complex *h_stage2;  /* ping-pong buffer B: a stage never writes the array it reads */
     tgk_complex *h_rhs;     /* RK weighted RHS accumulator */
 
     /* 3D electromagnetic fields [nz][nky][nkx] */

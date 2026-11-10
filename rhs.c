@@ -39,7 +39,7 @@ static inline tgk_complex fetch_chi_ts(const tgk_grid *gr, const tgk_complex *ph
  *
  * Memory budget per stage:
  * - Reads:  h_in (current stage distribution function), h (base state on stage > 0)
- * - Writes: h_rhs (accumulated RK update), h_stage (next stage state), plus FP64 field integral
+ * - Writes: h_rhs (accumulated RK update), h_stage/h_stage2 (next stage state), plus FP64 field integral
  *
  * Physics terms included in single slab pass:
  * 1. Parallel streaming: -v_th_s * v_par * b_hat.grad(z) * d(h + Z_s/T_s F0 J0 phi)/dz
@@ -72,8 +72,12 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
     const int has_apar    = (p->beta > 0.0);
     const int do_nl       = p->nonlinear;
 
-    /* Input distribution for this stage: stage 0 reads ctx->h, stages 1..3 read ctx->h_stage */
-    const tgk_complex *h_in = (stage_idx == 0) ? ctx->h : ctx->h_stage;
+    /* Stage buffers ping-pong so no stage overwrites the state it is still reading (the z and
+     * v_par stencils read neighbors that other iterations and threads would otherwise update):
+     *   stage 0: h -> A,  stage 1: A -> B,  stage 2: B -> A,  stage 3: A -> h (own index only) */
+    const tgk_complex *h_in = (stage_idx == 0) ? ctx->h
+                            : (stage_idx == 2) ? ctx->h_stage2 : ctx->h_stage;
+    tgk_complex *h_out      = (stage_idx == 1) ? ctx->h_stage2 : ctx->h_stage;
 
     const double inv_12dz = 1.0 / (12.0 * gm->dz);
     const double inv_12dv = 1.0 / (12.0 * gr->dv);
@@ -144,6 +148,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
         const tgk_real mr_p2 = (tgk_real)exp(((vpar + 2.0 * dvg) * (vpar + 2.0 * dvg) - vpar * vpar) * 0.25);
 
         const double q_fac = zs * ns;
+        const tgk_real kxfac = (tgk_real)gm->kxfac;
         const double a_fac = 0.5 * p->beta * zs * ns * vths * vpar;
 
         /* Precompute gyroaveraged field derivatives in real space once per (s, mu) across all z,
@@ -164,7 +169,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                     for (int ikx = 0; ikx < nkx; ikx++) {
                         tgk_real kx = (tgk_real)gr->kx[ikx];
                         size_t k = row + ikx;
-                        tgk_complex jp = tgk_cscale(j0_z[k], phi_z[k]);
+                        tgk_complex jp = tgk_cscale(j0_z[k] * kxfac, phi_z[k]);
                         spec_tmp1[k] = tgk_cmul_is(kx, jp);
                         spec_tmp2[k] = tgk_cmul_is(ky, jp);
                     }
@@ -180,7 +185,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         for (int ikx = 0; ikx < nkx; ikx++) {
                             tgk_real kx = (tgk_real)gr->kx[ikx];
                             size_t k = row + ikx;
-                            tgk_complex ja = tgk_cscale(j0_z[k], apar_z[k]);
+                            tgk_complex ja = tgk_cscale(j0_z[k] * kxfac, apar_z[k]);
                             spec_tmp1[k] = tgk_cmul_is(kx, ja);
                             spec_tmp2[k] = tgk_cmul_is(ky, ja);
                         }
@@ -199,6 +204,8 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
             const double dbdz  = gm->dbdz[iz];
             const double cv_x  = gm->cv_x[iz];
             const double cv_y  = gm->cv_y[iz];
+            const double gb_x  = gm->gb_x[iz];
+            const double gb_y  = gm->gb_y[iz];
 
             const size_t vidx  = (((size_t)s * nmu + imu) * nv + iv) * nz + iz;
             const tgk_real f0_val = gr->f0[vidx];
@@ -273,13 +280,20 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
             const tgk_real c_mirror = (tgk_real)(vths * mu * dbdz * gpar * inv_12dv);
             const tgk_real c_hypz   = (tgk_real)(-hyp_z * fabs(vths * vpar * gpar) / gm->dz);
             const tgk_real c_zt_f0  = (tgk_real)(z_t) * f0_val;
+            /* Streaming and mirror must act on h = g + (Z/T) F0 J0 chi. For the phi part the stencils
+             * above are exact (the compressional terms cancel); for the A_par part, chi = phi - v_t v A,
+             * they leave -(Z/T) v_t^2 mu gradpar dB/dz F0 J0 A_par, added here. */
+            const tgk_real c_apar_mir = (tgk_real)(-z_t * vths * vths * mu * gpar * dbdz) * f0_val;
 
             /* Energy factor for temperature-gradient drive: E/T_s - 3/2 = v_par^2/2 + mu*B - 1.5 */
             const double e_norm     = 0.5 * vpar * vpar + mu * b - 1.5;
             /* fprim, tprim are R/L_n, R/L_T; lengths are normalized to a, so divide by R/a */
             const double omega_star_fac = -(sp->fprim + e_norm * sp->tprim) / p->rmaj * (double)f0_val;
-            /* Magnetic drift velocity factor: (T_s / Z_s) * (v_par^2 + mu*B) */
-            const double v_drift    = (ts / zs) * (vpar * vpar + mu * b);
+            /* Magnetic drift: (T_s / Z_s) * [v_par^2 * curvature + mu*B * grad-B] */
+            const double dr_cv      = (ts / zs) * vpar * vpar;
+            const double dr_gb      = (ts / zs) * mu * b;
+            const double dr_y       = dr_cv * cv_y + dr_gb * gb_y;
+            const double dr_x       = dr_cv * cv_x + dr_gb * gb_x;
 
             const tgk_complex *phi_z  = ctx->phi  + z_off;
             const tgk_complex *apar_z = ctx->apar + z_off;
@@ -303,8 +317,8 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                 const double ky = gr->ky[iky];
                 const tgk_real w_star = (tgk_real)(ky * omega_star_fac);
 #if TGK_HAS_NEON && !TGK_REAL_IS_FP64
-                const tgk_real wd_y   = (tgk_real)(v_drift * cv_y * ky);
-                const tgk_real wd_x   = (tgk_real)(v_drift * cv_x);
+                const tgk_real wd_y   = (tgk_real)(dr_y * ky);
+                const tgk_real wd_x   = (tgk_real)(dr_x);
 #endif
 
                 int ikx = 0;
@@ -350,6 +364,10 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         tgk_vc2 g0  = tgk_vc2_fma_real(h0, c_zt_f0, chi0);
                         tgk_vc2 rhs = tgk_vc2_mul_is2(w_star, w_star, chi0);
                         rhs = tgk_vc2_fma_is2(rhs, -wd0, -wd1, g0);
+                        if (has_apar && !skip_par_stream) {
+                            tgk_vc2 ja = tgk_vc2_mul_real2(j0_0, j0_1, tgk_vc2_load(apar_z + k));
+                            rhs = vfmaq_n_f32(rhs, ja, c_apar_mir);
+                        }
 
                         if (!skip_par_stream) {
                             tgk_vc2 hm2 = tgk_vc2_load(hz_m2 + ikx);
@@ -381,8 +399,9 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                             dg_dz = vfmaq_n_f32(dg_dz, vsubq_f32(gp1, gm1), 8.0f);
                             rhs = vfmaq_n_f32(rhs, dg_dz, c_stream);
 
-                            tgk_vc2 d4h = vaddq_f32(hm2, hp2);
-                            d4h = vfmsq_n_f32(d4h, vaddq_f32(hm1, hp1), 4.0f);
+                            /* d4 of u = h / sqrt(F0), scaled back by sqrt(F0(here)) */
+                            tgk_vc2 d4h = vaddq_f32(vmulq_n_f32(hm2, sz_m2), vmulq_n_f32(hp2, sz_p2));
+                            d4h = vfmsq_n_f32(d4h, vaddq_f32(vmulq_n_f32(hm1, sz_m1), vmulq_n_f32(hp1, sz_p1)), 4.0f);
                             d4h = vfmaq_n_f32(d4h, h0, 6.0f);
                             rhs = vfmaq_n_f32(rhs, d4h, c_hypz);
                         }
@@ -413,12 +432,12 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                             tgk_vc2 r_acc = vmulq_n_f32(rhs, dt_b);
                             tgk_vc2_store(ctx->h_rhs + idx_full, r_acc);
                             h_next = vfmaq_n_f32(h0, rhs, dt_c);
-                            tgk_vc2_store(ctx->h_stage + idx_full, h_next);
+                            tgk_vc2_store(h_out + idx_full, h_next);
                         } else if (!is_last_stg) {
                             tgk_vc2 r_acc = vfmaq_n_f32(tgk_vc2_load(ctx->h_rhs + idx_full), rhs, dt_b);
                             tgk_vc2_store(ctx->h_rhs + idx_full, r_acc);
                             h_next = vfmaq_n_f32(tgk_vc2_load(ctx->h + idx_full), rhs, dt_c);
-                            tgk_vc2_store(ctx->h_stage + idx_full, h_next);
+                            tgk_vc2_store(h_out + idx_full, h_next);
                         } else {
                             tgk_vc2 r_acc  = tgk_vc2_load(ctx->h_rhs + idx_full);
                             tgk_vc2 h_base = tgk_vc2_load(ctx->h     + idx_full);
@@ -451,7 +470,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                     const size_t idx_full = slab_offset + z_off + k;
 
                     const double kx = gr->kx[ikx];
-                    const tgk_real w_d = (tgk_real)(v_drift * (cv_y * ky + cv_x * kx));
+                    const tgk_real w_d = (tgk_real)(dr_y * ky + dr_x * kx);
 
                     const tgk_complex h0 = h_slab[z_off + k];
                     const tgk_real j0_val = j0_z[k];
@@ -469,6 +488,10 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                     tgk_complex rhs = tgk_cmul_is(w_star, chi0);
                     tgk_complex wd_term = tgk_cmul_is(-w_d, g0);
                     rhs = tgk_cadd(rhs, wd_term);
+                    if (has_apar && !skip_par_stream) {
+                        rhs.re += c_apar_mir * j0_val * apar_z[k].re;
+                        rhs.im += c_apar_mir * j0_val * apar_z[k].im;
+                    }
 
                     /* 2. Parallel streaming & fourth-order z hyperdiffusion with twist-and-shift */
                     if (!skip_par_stream) {
@@ -496,10 +519,12 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         rhs.re += c_stream * dg_dz.re;
                         rhs.im += c_stream * dg_dz.im;
 
-                        /* 4th-order parallel hyperdiffusion: -(hm2 - 4*hm1 + 6*h0 - 4*hp1 + hp2) */
+                        /* 4th-order parallel hyperdiffusion on u = h / sqrt(F0), so it is
+                         * symmetric and dissipative in the free-energy norm at every mu:
+                         * -sqrt(F0) d4(h / sqrt(F0)), neighbors scaled by sqrt(F0(here)/F0(nbr)) */
                         tgk_complex d4h = {
-                            hm2.re - 4.0f * hm1.re + 6.0f * h0.re - 4.0f * hp1.re + hp2.re,
-                            hm2.im - 4.0f * hm1.im + 6.0f * h0.im - 4.0f * hp1.im + hp2.im
+                            sz_m2 * hm2.re - 4.0f * sz_m1 * hm1.re + 6.0f * h0.re - 4.0f * sz_p1 * hp1.re + sz_p2 * hp2.re,
+                            sz_m2 * hm2.im - 4.0f * sz_m1 * hm1.im + 6.0f * h0.im - 4.0f * sz_p1 * hp1.im + sz_p2 * hp2.im
                         };
                         rhs.re += c_hypz * d4h.re;
                         rhs.im += c_hypz * d4h.im;
@@ -537,7 +562,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         ctx->h_rhs[idx_full] = r_acc;
                         h_next.re = h0.re + dt_c * rhs.re;
                         h_next.im = h0.im + dt_c * rhs.im;
-                        ctx->h_stage[idx_full] = h_next;
+                        h_out[idx_full] = h_next;
                     } else if (!is_last_stg) {
                         tgk_complex r_acc = ctx->h_rhs[idx_full];
                         r_acc.re += dt_b * rhs.re;
@@ -547,7 +572,7 @@ void tgk_rhs_eval_fused_stage(tgk_ctx *ctx, int tid) {
                         tgk_complex h_base = ctx->h[idx_full];
                         h_next.re = h_base.re + dt_c * rhs.re;
                         h_next.im = h_base.im + dt_c * rhs.im;
-                        ctx->h_stage[idx_full] = h_next;
+                        h_out[idx_full] = h_next;
                     } else {
                         /* Final RK4 stage (stage 3): write completed step directly into ctx->h */
                         tgk_complex r_acc  = ctx->h_rhs[idx_full];
@@ -599,7 +624,8 @@ double tgk_rhs_compute_linear_cfl(const tgk_ctx *ctx) {
             double rate_stream = is_imex_elec ? 0.0 : (1.4 * vths * vmax * gpar / gm->dz);
             double rate_mirror = 1.4 * vths * mumax * dbdz * gpar / gr->dv;
             double rate_drift  = (sp->temp / fabs(sp->charge)) * (vmax * vmax + mumax * b) *
-                                 (fabs(gm->cv_y[iz]) * ky_max + fabs(gm->cv_x[iz]) * kx_max);
+                                 (fmax(fabs(gm->cv_y[iz]), fabs(gm->gb_y[iz])) * ky_max +
+                                  fmax(fabs(gm->cv_x[iz]), fabs(gm->gb_x[iz])) * kx_max);
             double rate_drive  = ky_max * (fabs(sp->fprim) + 2.0 * fabs(sp->tprim)) / p->rmaj;
 
             double tot = rate_stream + rate_mirror + rate_drift + rate_drive;

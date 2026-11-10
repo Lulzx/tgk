@@ -240,22 +240,92 @@ static double run_linear_mode(double ky, double r_lt, double r_ln, int kinetic_e
     return (navg > 0) ? (gamma_avg / navg) : 0.0;
 }
 
+/* Linear runs on the GX benchmark parameters (benchmarks/linear/ITG_cyclone in the GX
+ * repository: q = 1.4, shat = 0.8, eps = 0.18, R/a = 2.77778, a/L_T = 2.49, a/L_n = 0.8).
+ * geom: 0 = s-alpha, 1 = Miller with elongation kappa. kinetic: explicit kinetic electrons
+ * (m_e/m_i = 2.7e-4, same gradients), electrostatic. Returns the growth rate fitted over the
+ * last 40% of the run. */
+static double run_linear_gx(double ky, int geom, double kappa, int kinetic, double t_end,
+                            double dt_max, double *omega_out) {
+    tgk_param p;
+    tgk_param_defaults(&p);
+    p.nkx = 8; p.nky = 2; p.nz = 24; p.nv = 32; p.nmu = 8;
+    p.ky_min = ky; p.shat = 0.8; p.q0 = 1.4; p.eps = 0.18; p.rmaj = 2.77778;
+    p.kx_max = 2.0 * 3.14159265358979323846 * p.shat * ky * (p.nkx / 2);
+    p.nonlinear = 0; p.dt_max = dt_max; p.hyper_z = 0.15;
+    p.spec[0].tprim = 2.49 * p.rmaj; p.spec[0].fprim = 0.8 * p.rmaj; p.spec[0].nu = 0.0;
+    if (geom == 1) { p.geom_type = TGK_GEOM_MILLER; p.kappa = kappa; }
+    if (kinetic) {
+        p.nspecies = 2; p.adiabatic_electrons = 0; p.imex = 0;
+        p.spec[1].mass = 2.7e-4; p.spec[1].tprim = p.spec[0].tprim; p.spec[1].fprim = p.spec[0].fprim;
+        p.spec[1].nu = 0.0;
+    }
+    tgk_ctx ctx;
+    tgk_ctx_init(&ctx, &p);
+    tgk_init_perturbation(&ctx);
+    tgk_diag_out d;
+    double st = 0, sl = 0, stt = 0, stl = 0, w_sum = 0.0; int n = 0, nw = 0;
+    while (ctx.time < t_end) {
+        tgk_step_rk4(&ctx);
+        if (ctx.step % 10 == 0) {
+            tgk_diag_compute(&ctx, ctx.h, &d);
+            if (ctx.time > 0.6 * t_end) {
+                double l = 0.5 * log(d.phi2_total);
+                st += ctx.time; sl += l; stt += ctx.time * ctx.time; stl += ctx.time * l; n++;
+                w_sum += d.omega_max; nw++;
+            }
+        }
+    }
+    tgk_ctx_free(&ctx);
+    if (omega_out) *omega_out = (nw > 0) ? w_sum / nw : 0.0;
+    return (n > 1) ? (n * stl - st * sl) / (n * stt - st * st) : 0.0;
+}
+
+/* Final |phi|^2 of a short linear run with a fixed time step (RK4 order check) */
+static double phi2_fixed_dt(double dt) {
+    tgk_param p;
+    tgk_param_defaults(&p);
+    p.nkx = 8; p.nky = 2; p.nz = 24; p.nv = 32; p.nmu = 8;
+    p.ky_min = 0.3; p.kx_max = 2.0 * 3.14159265358979323846 * p.shat * 0.3 * 4;
+    p.nonlinear = 0; p.dt_max = dt; p.cfl_frac = 100.0;  /* dt = dt_max exactly */
+    tgk_ctx ctx;
+    tgk_ctx_init(&ctx, &p);
+    tgk_init_perturbation(&ctx);
+    int nsteps = (int)lround(2.0 / dt);
+    ctx.dt = dt;
+    for (int i = 0; i < nsteps; i++) { ctx.dt = dt; tgk_step_rk4(&ctx); }
+    tgk_diag_out d;
+    tgk_diag_compute(&ctx, ctx.h, &d);
+    tgk_ctx_free(&ctx);
+    return d.phi2_total;
+}
+
 static void test_linear_benchmarks(void) {
-    printf("\n--- Test 2: Linear Cyclone Base Case, TEM, KBM & Miller Geometry ---\n");
+    printf("\n--- Test 2: Linear benchmarks against GX reference data ---\n");
 
-    double omega_cbc3 = 0.0, omega_cbc5 = 0.0;
-    double gamma_cbc3 = run_linear_mode(0.3, 6.92, 2.22, 0, 0.0, 0, 0, &omega_cbc3, NULL);
-    double gamma_cbc5 = run_linear_mode(0.5, 6.92, 2.22, 0, 0.0, 0, 0, &omega_cbc5, NULL);
+    /* RK4 is fourth order: halving dt reduces the error ~16x. (A stage that overwrote the
+     * state it was still reading made the scheme inconsistent and unstable at large mu and kx.)
+     * In FP32 the truncation error of this smooth case is below round-off (~1e-7), so the order
+     * is measured in the FP64 build and FP32 checks the error level. */
+    {
+        double ref = phi2_fixed_dt(0.0025);
+        double e1 = fabs(phi2_fixed_dt(0.04) - ref) / ref, e2 = fabs(phi2_fixed_dt(0.02) - ref) / ref;
+#ifdef TGK_USE_FP64
+        double order = log(e1 / e2) / log(2.0);
+        CHECK(order > 3.5 && order < 4.5, "RK4 converges at 4th order: errors %.2e (dt=0.04), %.2e (dt=0.02), order %.2f",
+              e1, e2, order);
+#else
+        CHECK(e1 < 1e-6 && e2 < 1e-6, "RK4 error at FP32 round-off level: %.2e (dt=0.04), %.2e (dt=0.02)", e1, e2);
+#endif
+    }
 
-    /* Adiabatic-electron Cyclone Base Case, ky rho_i = 0.3: published gamma ~ 0.1 v_ti/a.
-     * The real frequency is negative in TGK's sign convention (ITG direction). */
-    CHECK(gamma_cbc3 > 0.07 && gamma_cbc3 < 0.13 && omega_cbc3 < 0.0,
-          "Cyclone Base Case (ky=0.3) linear ITG growth rate gamma=%.4f, omega=%.4f",
-          gamma_cbc3, omega_cbc3);
-    /* ITG |omega| grows with ky in the same direction */
-    CHECK(gamma_cbc5 > 0.0 && omega_cbc5 < omega_cbc3,
-          "Cyclone Base Case (ky=0.5) unstable, |omega| increases with ky: gamma=%.4f, omega=%.4f",
-          gamma_cbc5, omega_cbc5);
+    /* GX reference (itg_salpha_adiabatic_electrons_correct.out.nc): ky = 0.3: gamma 0.0930,
+     * omega 0.2820 (GX sign; ion direction is negative in TGK). nmu = 8 carries ~4% mu
+     * discretization error (see validation/README.md). */
+    double omega_cbc = 0.0;
+    double gamma_cbc = run_linear_gx(0.3, 0, 1.0, 0, 150.0, 0.05, &omega_cbc);
+    CHECK(fabs(gamma_cbc / 0.0930 - 1.0) < 0.05 && fabs(-omega_cbc / 0.2820 - 1.0) < 0.03,
+          "s-alpha Cyclone vs GX, ky=0.3: gamma=%.4f (GX 0.0930), omega=%.4f (GX -0.2820)", gamma_cbc, omega_cbc);
 
     /* R/L_T = 1, R/L_n = 0 is far below the ITG threshold: the free energy must decay.
      * (An instantaneous growth rate is not meaningful here: damped modes beat.) */
@@ -264,19 +334,23 @@ static void test_linear_benchmarks(void) {
     CHECK(w_ratio < 0.5,
           "Sub-critical gradient (R/L_T=1.0) is linearly stable: W(t=40)/W(0) = %.3f", w_ratio);
 
-    /* Miller geometry reduces to s-alpha in the circular limit; shaped case stays unstable */
-    double gamma_mcirc  = run_linear_mode(0.3, 6.92, 2.22, 0, 0.0, 0, 2, NULL, NULL);
-    double gamma_miller = run_linear_mode(0.3, 6.92, 2.22, 0, 0.0, 0, 1, NULL, NULL);
-    CHECK(fabs(gamma_mcirc / gamma_cbc3 - 1.0) < 0.05,
-          "Miller circular limit matches s-alpha: gamma=%.4f vs %.4f", gamma_mcirc, gamma_cbc3);
-    CHECK(gamma_miller > 0.02,
-          "Miller shaped geometry (kappa=1.4, delta=0.2) ITG growth rate gamma=%.4f", gamma_miller);
+    /* Circular Miller is not s-alpha: GX gives gamma = 0.1259 at ky = 0.3 (vs 0.0930) */
+    double gamma_mc = run_linear_gx(0.3, 1, 1.0, 0, 150.0, 0.05, NULL);
+    CHECK(fabs(gamma_mc / 0.1259 - 1.0) < 0.05,
+          "Circular Miller vs GX, ky=0.3: gamma=%.4f (GX 0.1259; s-alpha %.4f)", gamma_mc, gamma_cbc);
 
-    /* Kinetic electrons + IMEX + electromagnetic A_par (ITG/TEM/KBM capability) */
+    /* Elongation at fixed q, shat and gradients is stabilizing (GS2: see validation/README.md) */
+    double gamma_k14 = run_linear_gx(0.3, 1, 1.4, 0, 150.0, 0.05, NULL);
+    CHECK(gamma_k14 < 0.95 * gamma_mc,
+          "Elongation kappa=1.4 stabilizes ITG at ky=0.3: gamma=%.4f vs %.4f circular", gamma_k14, gamma_mc);
+
+    /* Electrostatic kinetic electrons, explicit (GX itg_miller_kinetic_electrons: ky = 0.3,
+     * gamma 0.2300, omega 0.2363). The IMEX path and the electromagnetic kinetic-electron
+     * path are not validated and are not tested here. */
     double omega_ke = 0.0;
-    double gamma_ke = run_linear_mode(0.3, 6.92, 3.50, 1, 0.005, 1, 0, &omega_ke, NULL);
-    CHECK(isfinite(gamma_ke) && gamma_ke > 0.03,
-          "Kinetic electrons + electromagnetic A_par (beta=0.5%%) + IMEX growth rate: gamma=%.4f, omega=%.4f",
+    double gamma_ke = run_linear_gx(0.3, 1, 1.0, 1, 40.0, 0.002, &omega_ke);
+    CHECK(fabs(gamma_ke / 0.2300 - 1.0) < 0.06 && fabs(-omega_ke / 0.2363 - 1.0) < 0.05,
+          "Kinetic electrons (electrostatic, explicit) vs GX, ky=0.3: gamma=%.4f (GX 0.2300), omega=%.4f (GX -0.2363)",
           gamma_ke, omega_ke);
 
     /* Free-energy balance dW/dt = drive + hyperdiffusion: the drive term is built from the

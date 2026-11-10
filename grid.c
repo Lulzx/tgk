@@ -290,20 +290,26 @@ int tgk_grid_init(const tgk_param *p, const tgk_geom *g, tgk_grid *gr) {
                     double ts   = p->spec[s].temp;
                     double ms   = p->spec[s].mass;
                     /* Compute discrete velocity integral of J0^2 to be 100% consistent with numerator */
-                    double gamma0_disc = 0.0;
+                    double gamma0_disc = 0.0, gamma0_v2 = 0.0;
                     for (int imu = 0; imu < gr->nmu; imu++) {
                         size_t jidx = ((size_t)s * gr->nmu + imu) * gr->nfield + fidx;
                         double j0_val = (double)gr->j0[jidx];
                         for (int iv = 0; iv < gr->nv; iv++) {
                             size_t vidx = (((size_t)s * gr->nmu + imu) * gr->nv + iv) * gr->nz + iz;
-                            gamma0_disc += gr->w_vel[vidx] * (double)gr->f0[vidx] * j0_val * j0_val;
+                            double wfj = gr->w_vel[vidx] * (double)gr->f0[vidx] * j0_val * j0_val;
+                            gamma0_disc += wfj;
+                            gamma0_v2   += wfj * gr->vpar[iv] * gr->vpar[iv];
                         }
                     }
                     qn_d += (zs * zs * ns / ts) * (1.0 - gamma0_disc);
 
                     if (p->beta > 0.0) {
-                        /* Parallel Ampere's law skin-depth / beta term when evolving g_s = h_s + ... */
-                        amp_d += (p->beta * zs * zs * ns / ms) * gamma0_disc;
+                        /* The evolved variable is g = h - (Z/T) F0 J0 (phi - v_t v_par A_par), so the
+                         * current of h contains -(Z^2 n / m) <v_par^2 F0 J0^2> A_par. With the
+                         * (beta/2) normalization of the right-hand side (rhs.c a_fac):
+                         * [k_perp^2 + (beta/2) sum Z^2 n / m <v^2 F0 J0^2>] A_par = (beta/2) sum Z n v_t int v J0 g.
+                         * Uses the same discrete quadrature as the numerator. */
+                        amp_d += (0.5 * p->beta * zs * zs * ns / ms) * gamma0_v2;
                     }
                 }
 

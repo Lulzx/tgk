@@ -149,8 +149,13 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
                                 tgk_complex hm1 = tgk_fetch_z_ts(gr, h_slab, iz - 1, iky, ikx);
                                 tgk_complex hp1 = tgk_fetch_z_ts(gr, h_slab, iz + 1, iky, ikx);
                                 tgk_complex hp2 = tgk_fetch_z_ts(gr, h_slab, iz + 2, iky, ikx);
-                                double d4_re = (double)hm2.re - 4.0 * hm1.re + 6.0 * hk.re - 4.0 * hp1.re + hp2.re;
-                                double d4_im = (double)hm2.im - 4.0 * hm1.im + 6.0 * hk.im - 4.0 * hp1.im + hp2.im;
+                                /* same operator as rhs.c: d4 of h / sqrt(F0), scaled by sqrt(F0(here)) */
+                                double szm2 = exp(-0.5 * mu * (b - gm->bmag[(iz - 2 + nz) % nz]));
+                                double szm1 = exp(-0.5 * mu * (b - gm->bmag[(iz - 1 + nz) % nz]));
+                                double szp1 = exp(-0.5 * mu * (b - gm->bmag[(iz + 1) % nz]));
+                                double szp2 = exp(-0.5 * mu * (b - gm->bmag[(iz + 2) % nz]));
+                                double d4_re = szm2 * hm2.re - 4.0 * szm1 * hm1.re + 6.0 * hk.re - 4.0 * szp1 * hp1.re + szp2 * hp2.re;
+                                double d4_im = szm2 * hm2.im - 4.0 * szm1 * hm1.im + 6.0 * hk.im - 4.0 * szp1 * hp1.im + szp2 * hp2.im;
                                 double c_hypz = -hyp_z * fabs(vths * vpar * gm->gradpar[iz]) / gm->dz;
                                 double cx_re = (double)ph.re, cx_im = (double)ph.im;
                                 if (has_apar) {
@@ -212,8 +217,9 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
     }
 
     for (int s = 0; s < nspecies; s++) {
-        double q_s = tgk_pairwise_sum_f64(slab_q + (size_t)s * nmu, nmu);
-        double g_s = tgk_pairwise_sum_f64(slab_g + (size_t)s * nmu, nmu);
+        /* Radial fluxes of rho per unit area: divide <Gamma . grad rho> by <|grad rho|> (GS2/GX) */
+        double q_s = tgk_pairwise_sum_f64(slab_q + (size_t)s * nmu, nmu) / gm->grho_avg;
+        double g_s = tgk_pairwise_sum_f64(slab_g + (size_t)s * nmu, nmu) / gm->grho_avg;
         if (p->spec[s].charge > 0.0) {
             out->heat_flux_i += q_s;
             out->part_flux_i += g_s;
@@ -225,8 +231,10 @@ void tgk_diag_compute(tgk_ctx *ctx, const tgk_complex *h_in, tgk_diag_out *out) 
             double grad_te = fmax(p->spec[s].tprim / p->rmaj, 1e-12);
             out->chi_e = out->heat_flux_e / (p->spec[s].dens * p->spec[s].temp * grad_te);
         }
-        out->fe_drive += (p->spec[s].fprim * g_s * p->spec[s].temp +
-                          p->spec[s].tprim * (q_s - 1.5 * g_s * p->spec[s].temp)) / p->rmaj;
+        /* The gradient drive acts through <Gamma . grad rho>, before the area normalization */
+        double ga = gm->grho_avg;
+        out->fe_drive += ga * (p->spec[s].fprim * g_s * p->spec[s].temp +
+                               p->spec[s].tprim * (q_s - 1.5 * g_s * p->spec[s].temp)) / p->rmaj;
     }
 
     out->free_energy = tgk_pairwise_sum_f64(slab_fe, (size_t)nspecies * nmu) + fe_field;

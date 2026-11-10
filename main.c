@@ -67,6 +67,7 @@ int tgk_param_defaults(tgk_param *p) {
     p->delta               = 0.0;
     p->s_delta             = 0.0;
     p->shift               = 0.0;
+    p->betaprim            = 0.0;
 
     p->adiabatic_electrons = 1;
     p->tau_e               = 1.0;
@@ -178,6 +179,7 @@ int tgk_param_parse_file(tgk_param *p, const char *filename) {
         else if (strcmp(key, "delta") == 0)               p->delta = atof(val);
         else if (strcmp(key, "s_delta") == 0)             p->s_delta = atof(val);
         else if (strcmp(key, "shift") == 0)               p->shift = atof(val);
+        else if (strcmp(key, "betaprim") == 0)            p->betaprim = atof(val);
         else if (strcmp(key, "adiabatic_electrons") == 0) p->adiabatic_electrons = atoi(val);
         else if (strcmp(key, "tau_e") == 0)               p->tau_e = atof(val);
         else if (strcmp(key, "beta") == 0)                p->beta = atof(val);
@@ -316,9 +318,10 @@ int tgk_ctx_init(tgk_ctx *ctx, const tgk_param *p) {
     size_t ntot   = ctx->grid.ntot;
     size_t nfield = ctx->grid.nfield;
 
-    /* Allocate the 3 full-size 5D buffers (h, h_stage, h_rhs) */
+    /* Allocate the full-size 5D buffers (h, two stage buffers, h_rhs) */
     ctx->h       = tgk_malloc_aligned(sizeof(tgk_complex) * ntot);
     ctx->h_stage = tgk_malloc_aligned(sizeof(tgk_complex) * ntot);
+    ctx->h_stage2 = tgk_malloc_aligned(sizeof(tgk_complex) * ntot);
     ctx->h_rhs   = tgk_malloc_aligned(sizeof(tgk_complex) * ntot);
 
     /* Allocate 3D fields and global FP64 accumulators */
@@ -405,6 +408,7 @@ void tgk_ctx_free(tgk_ctx *ctx) {
 
     tgk_free_aligned(ctx->h);
     tgk_free_aligned(ctx->h_stage);
+    tgk_free_aligned(ctx->h_stage2);
     tgk_free_aligned(ctx->h_rhs);
     tgk_free_aligned(ctx->phi);
     tgk_free_aligned(ctx->apar);
@@ -537,6 +541,16 @@ int main(int argc, char **argv) {
     tgk_param_defaults(&param);
     if (tgk_param_parse_file(&param, argv[1]) != 0) {
         return 1;
+    }
+
+    /* Known-unvalidated paths (see README, "Validation status") */
+    if (!param.adiabatic_electrons && param.imex) {
+        fprintf(stderr, "tgk: WARNING: imex = 1 is not validated: it gives spurious growth rates ~3-4x GX's\n"
+                        "     for kinetic-electron ITG, even electrostatically. Use imex = 0.\n");
+    }
+    if (!param.adiabatic_electrons && param.beta > 0.0) {
+        fprintf(stderr, "tgk: WARNING: electromagnetic kinetic electrons (beta > 0) are not validated: the\n"
+                        "     discrete system has a spurious instability that grows without any gradient drive.\n");
     }
 
     tgk_ctx ctx;
