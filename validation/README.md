@@ -155,22 +155,18 @@ to t = 400 a/v_t. Every grid has nz = 24, nv = 32 and nmu = 8. Raising
 nkx and nky extends the resolved kx and ky range in a fixed box.
 
 The heat diffusivity χ_i is in units of ρ² v_t / a. The mean is taken over
-t ∈ [150, 400], and "std" is the standard deviation of the instantaneous
-χ_i over that window.
+t ∈ [150, 400].
 
 | run | nkx × nky | t_end | ⟨χ_i⟩, t ∈ [150, t_end] | standard error | ⟨χ_i⟩ [150, 275] | ⟨χ_i⟩ [275, t_end] |
 |---|---|---|---|---|---|---|
 | R1 | 32 × 16 | 400 | 1.014 | 0.026 | 0.988 | 1.040 |
 | R2 | 64 × 24 | 400 | 1.159 | 0.082 | 1.317 | 0.995 |
-| R3 | 128 × 32 | 311* | 0.965 | 0.148 | 0.980 | 0.914 |
-
-\* R3 was still running when this was committed; its row covers
-t ∈ [150, 311] and will be updated at t = 400.
+| R3 | 128 × 32 | 400 | 0.974 | 0.099 | 0.980 | 0.969 |
 
 The standard error comes from the means of 25-unit time blocks. Across
 the three resolutions χ_i is 1.0–1.2, and the differences between them
 lie within about 1.5 standard errors. At this level of statistics, χ_i
-is converged in perpendicular resolution at about 1.05 ± 0.1.
+is converged in perpendicular resolution at about 1.0 ± 0.1.
 
 The small grid used in `make check` (16 × 8, ŝ = 0.796) gives 1.74. That
 test only checks for saturation and loose bounds.
